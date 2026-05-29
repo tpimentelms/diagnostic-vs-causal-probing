@@ -11,7 +11,7 @@ import wandb
 from datasets import Dataset
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from tqdm import tqdm, trange
 from transformers import Trainer, TrainingArguments
 
@@ -287,7 +287,43 @@ def train_mlp(train_ds, test_ds, embedding_dim, batch_size=1024, epochs=3):
     return model, trainer
 
 
+def load_or_train_mlp(train_ds, test_ds, embedding_dim, n_examples, epochs=5, device='cpu', **cache_params):
+    mlp_params = {**cache_params, "epochs": epochs}
+    path = Path(str(_cache_path("mlp", n_examples, **mlp_params)) + ".pt")
+    config = MLPConfig(h_dim=embedding_dim * 4, activation_function="relu", n_layer=3, num_classes=2, pdrop=0.0)
+    if path.exists():
+        print(f"Loading cached MLP from {path}")
+        _, _, model = create_mlp_classifier(config)
+        model.to(device)
+        model.load_state_dict(torch.load(str(path), map_location=device, weights_only=True))
+        return model
+    CACHE_DIR.mkdir(exist_ok=True)
+    trained, _ = train_mlp(train_ds, test_ds, embedding_dim, epochs=epochs)
+    torch.save(trained.state_dict(), str(path))
+    return trained
+
+
 # ── DAS ───────────────────────────────────────────────────────────────────────
+
+class BatchedRandomSampler(Sampler):
+    """Shuffles batch order without mixing examples across batch boundaries.
+
+    pyvene stores counterfactual examples in contiguous blocks of batch_size,
+    each block sharing the same intervention_id. Shuffling individual examples
+    would mix types within a DataLoader batch; this sampler shuffles block order
+    instead so each epoch sees a different interleaving of intervention types.
+    """
+    def __init__(self, n_examples, batch_size):
+        self.n_batches = n_examples // batch_size
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        for b in torch.randperm(self.n_batches).tolist():
+            yield from range(b * self.batch_size, (b + 1) * self.batch_size)
+
+    def __len__(self):
+        return self.n_batches * self.batch_size
+
 
 def build_das_intervenable(model, device):
     config = IntervenableConfig(
@@ -349,7 +385,8 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10, 
 
     step = 0
     for epoch in trange(epochs, desc="Epoch"):
-        epoch_iter = tqdm(DataLoader(dataset, batch_size=batch_size), desc=f"Epoch {epoch}", leave=True)
+        sampler = BatchedRandomSampler(len(dataset), batch_size)
+        epoch_iter = tqdm(DataLoader(dataset, batch_size=batch_size, sampler=sampler), desc=f"Epoch {epoch}", leave=True)
         for batch in epoch_iter:
             batch["input_ids"] = batch["input_ids"].unsqueeze(1)
             batch["source_input_ids"] = batch["source_input_ids"].unsqueeze(2)
@@ -461,7 +498,9 @@ def main(args):
     # eval_factual(handcrafted, hc_causal_model, hc_causal_model.sample_input_tree_balanced, prefix="handcrafted")
 
     print("\n=== Generating or Loading Data for Hierarchical Equality ===")
-    embedding_dim, n_mlp_examples, n_probe_examples, n_test_examples, das_batch_size = 4, 2**20, 2**20, 10000, 6400
+    embedding_dim, n_mlp_examples, n_test_examples, das_batch_size = 4, 2**20, 10000, 6400
+    n_das_train_examples = 10 * das_batch_size   # 1,280,000 — matches tutorial; ~67 blocks of each type
+    n_das_test_examples = 3 * das_batch_size       # 19,200 — minimum for all 3 intervention types
     n_train_entities, n_test_entities = 100, 100
     sampler = make_input_sampler(embedding_dim)
     train_causal_model = build_causal_model(embedding_dim, n_entities=n_train_entities)
@@ -470,16 +509,19 @@ def main(args):
     cache_params = dict(dim=embedding_dim, seed=args.seed, nentities=n_train_entities)
     train_ds = load_or_generate_factual("train", train_causal_model, n_mlp_examples, sampler, **cache_params)
     test_ds = load_or_generate_factual("test", test_causal_model, n_test_examples, sampler, **cache_params)
-    train_dataset = load_or_generate_counterfactual("train", train_causal_model, n_probe_examples, das_batch_size, sampler, **cache_params)
-    test_dataset = load_or_generate_counterfactual("test", test_causal_model, n_test_examples, das_batch_size, sampler, **cache_params)
+    train_dataset = load_or_generate_counterfactual("train", train_causal_model, n_das_train_examples, das_batch_size, sampler, **cache_params)
+    test_dataset = load_or_generate_counterfactual("test", test_causal_model, n_das_test_examples, das_batch_size, sampler, **cache_params)
     # import ipdb; ipdb.set_trace()
 
     print("\n=== Training and Evaluating MLP on Hierarchical Equality ===")
-    trained, trainer = train_mlp(train_ds, test_ds, embedding_dim, epochs=5)
-    test_preds = trainer.predict(test_ds)
+    trained = load_or_train_mlp(train_ds, test_ds, embedding_dim, n_mlp_examples, epochs=5, device=device, **cache_params)
+    trained.eval()
+    with torch.no_grad():
+        test_inputs = torch.tensor(np.array(test_ds["inputs_embeds"]), dtype=torch.float32).to(device)
+        test_logits = trained(inputs_embeds=test_inputs.unsqueeze(1))[0]
     y_test = np.array(test_ds["labels"]).argmax(1)
     print("Trained MLP factual accuracy:")
-    print(classification_report(y_test, test_preds[0].argmax(1)))
+    print(classification_report(y_test, test_logits.argmax(1).cpu().numpy()))
 
     print("\n=== Diagnostic Probe Experiment ===")
     run_probe_experiment(trained, train_ds, test_ds, embedding_dim, device=device)
