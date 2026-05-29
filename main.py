@@ -557,7 +557,7 @@ def main(args):
     print("\n=== Distributed Alignment Search ===")
     intervenable = build_das_intervenable(trained, device)
     accumulation_steps = 6400 // das_batch_size
-    train_das(intervenable, train_dataset, embedding_dim, batch_size=das_batch_size, epochs=100, accumulation_steps=accumulation_steps, device=device)
+    train_das(intervenable, train_dataset, embedding_dim, batch_size=das_batch_size, epochs=10, accumulation_steps=accumulation_steps, device=device)
     print("DAS counterfactual accuracy:")
     eval_das(intervenable, test_dataset, embedding_dim, batch_size=das_batch_size, device=device)
 
