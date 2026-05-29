@@ -1,0 +1,17 @@
+name: aisi-test
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pytorch
+  - torchvision
+  - torchaudio
+  - scikit-learn
+  - tqdm
+  - pip:
+    - pyvene
+    - nnsight
+    - wandb
