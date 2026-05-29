@@ -17,7 +17,6 @@ from transformers import Trainer, TrainingArguments
 
 from pyvene import CausalModel, IntervenableModel, create_mlp_classifier
 from pyvene import (
-    CollectIntervention,
     IntervenableConfig,
     RepresentationConfig,
     RotatedSpaceIntervention,
@@ -398,31 +397,19 @@ def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, device=
 
 # ── Diagnostic Probe ─────────────────────────────────────────────────────────
 
-def build_probe_intervenable(model, layer_idx, device):
-    config = IntervenableConfig(
-        model_type=type(model),
-        representations=[RepresentationConfig(layer_idx, "block_output", "pos", 1)],
-        intervention_types=CollectIntervention,
-    )
-    intervenable = IntervenableModel(config, model)
-    intervenable.set_device(device)
-    intervenable.disable_model_gradients()
-    return intervenable
-
-
-def _collect_activations(intervenable, dataset, batch_size=1024, device="cpu"):
+def _collect_activations(model, dataset, layer_idx, batch_size=1024, device="cpu"):
     all_acts = []
-    intervenable.model.eval()
+
+    def hook_fn(module, input, output):
+        all_acts.append(output.detach().squeeze(1).cpu().numpy())
+
+    hook = model.mlp.h[layer_idx].register_forward_hook(hook_fn)
+    model.eval()
     with torch.no_grad():
         for batch in tqdm(DataLoader(dataset.with_format("torch"), batch_size=batch_size), desc="Collecting", leave=False):
-            b = batch["inputs_embeds"].shape[0]
             inputs = batch["inputs_embeds"].to(device).unsqueeze(1)
-            _, collected = intervenable(
-                {"inputs_embeds": inputs},
-                [None],
-                {"sources->base": ([None], [[[0]] * b])},
-            )
-            all_acts.append(collected[0].squeeze(1).cpu().numpy())
+            model(inputs_embeds=inputs)
+    hook.remove()
     return np.concatenate(all_acts)
 
 
@@ -441,9 +428,8 @@ def run_probe_experiment(model, train_ds, test_ds, embedding_dim, n_layers=3, ba
 
     log_data = {}
     for layer_idx in range(n_layers):
-        intervenable = build_probe_intervenable(model, layer_idx, device)
-        train_acts = _collect_activations(intervenable, train_ds, batch_size, device)
-        test_acts = _collect_activations(intervenable, test_ds, batch_size, device)
+        train_acts = _collect_activations(model, train_ds, layer_idx, batch_size, device)
+        test_acts = _collect_activations(model, test_ds, layer_idx, batch_size, device)
         for concept in ["WX", "YZ", "O"]:
             probe = LogisticRegression(max_iter=1000)
             probe.fit(train_acts, train_labels[concept])
