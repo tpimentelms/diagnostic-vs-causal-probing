@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import wandb
 from datasets import Dataset
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report
 from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
@@ -16,6 +17,7 @@ from transformers import Trainer, TrainingArguments
 
 from pyvene import CausalModel, IntervenableModel, create_mlp_classifier
 from pyvene import (
+    CollectIntervention,
     IntervenableConfig,
     RepresentationConfig,
     RotatedSpaceIntervention,
@@ -307,8 +309,8 @@ def _run_intervenable_batch(intervenable, batch, embedding_dim):
     assert batch["intervention_id"].unique().numel() == 1, \
         "All examples in a batch must share the same intervention_id"
     batch_size = batch["input_ids"].shape[0]
-    wx_subspace = [[i for i in range(0, embedding_dim * 2)]] * batch_size
-    yz_subspace = [[i for i in range(embedding_dim * 2, embedding_dim * 4)]] * batch_size
+    wx_subspace = [[_ for _ in range(0, embedding_dim * 2)]] * batch_size
+    yz_subspace = [[_ for _ in range(embedding_dim * 2, embedding_dim * 4)]] * batch_size
     pos = [[[0]] * batch_size]
 
     if batch["intervention_id"][0] == 2:
@@ -394,6 +396,65 @@ def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, device=
         wandb.log({"das/eval_accuracy": report["accuracy"]})
 
 
+# ── Diagnostic Probe ─────────────────────────────────────────────────────────
+
+def build_probe_intervenable(model, layer_idx, device):
+    config = IntervenableConfig(
+        model_type=type(model),
+        representations=[RepresentationConfig(layer_idx, "block_output", "pos", 1)],
+        intervention_types=CollectIntervention,
+    )
+    intervenable = IntervenableModel(config, model)
+    intervenable.set_device(device)
+    intervenable.disable_model_gradients()
+    return intervenable
+
+
+def _collect_activations(intervenable, dataset, batch_size=1024, device="cpu"):
+    all_acts = []
+    intervenable.model.eval()
+    with torch.no_grad():
+        for batch in tqdm(DataLoader(dataset.with_format("torch"), batch_size=batch_size), desc="Collecting", leave=False):
+            b = batch["inputs_embeds"].shape[0]
+            inputs = batch["inputs_embeds"].to(device).unsqueeze(1)
+            _, collected = intervenable(
+                {"inputs_embeds": inputs},
+                [None],
+                {"sources->base": ([None], [[[0]] * b])},
+            )
+            all_acts.append(collected[0].squeeze(1).cpu().numpy())
+    return np.concatenate(all_acts)
+
+
+def _probe_labels(ds, embedding_dim):
+    inputs = np.array(ds["inputs_embeds"])
+    d = embedding_dim
+    WX = (np.abs(inputs[:, :d] - inputs[:, d:2*d]).sum(1) < 1e-6).astype(int)
+    YZ = (np.abs(inputs[:, 2*d:3*d] - inputs[:, 3*d:]).sum(1) < 1e-6).astype(int)
+    O = np.array(ds["labels"]).argmax(1)
+    return {"WX": WX, "YZ": YZ, "O": O}
+
+
+def run_probe_experiment(model, train_ds, test_ds, embedding_dim, n_layers=3, batch_size=1024, device="cpu"):
+    train_labels = _probe_labels(train_ds, embedding_dim)
+    test_labels = _probe_labels(test_ds, embedding_dim)
+
+    log_data = {}
+    for layer_idx in range(n_layers):
+        intervenable = build_probe_intervenable(model, layer_idx, device)
+        train_acts = _collect_activations(intervenable, train_ds, batch_size, device)
+        test_acts = _collect_activations(intervenable, test_ds, batch_size, device)
+        for concept in ["WX", "YZ", "O"]:
+            probe = LogisticRegression(max_iter=1000)
+            probe.fit(train_acts, train_labels[concept])
+            acc = probe.score(test_acts, test_labels[concept])
+            print(f"  Layer {layer_idx} -> {concept}: {acc:.4f}")
+            log_data[f"probe/layer{layer_idx}/{concept}"] = acc
+
+    if wandb.run is not None:
+        wandb.log(log_data)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(args):
@@ -414,24 +475,28 @@ def main(args):
     # eval_factual(handcrafted, hc_causal_model, hc_causal_model.sample_input_tree_balanced, prefix="handcrafted")
 
     print("\n=== Generating or Loading Data for Hierarchical Equality ===")
-    embedding_dim, n_train_examples, n_test_examples, das_batch_size = 4, 2**20, 10000, 6400
+    embedding_dim, n_mlp_examples, n_probe_examples, n_test_examples, das_batch_size = 4, 2**20, 2**20, 10000, 6400
     n_train_entities, n_test_entities = 100, 100
     sampler = make_input_sampler(embedding_dim)
     train_causal_model = build_causal_model(embedding_dim, n_entities=n_train_entities)
     test_causal_model = build_causal_model(embedding_dim, n_entities=n_test_entities)
 
     cache_params = dict(dim=embedding_dim, seed=args.seed, nentities=n_train_entities)
-    train_ds = load_or_generate_factual("train", train_causal_model, n_train_examples, sampler, **cache_params)
+    train_ds = load_or_generate_factual("train", train_causal_model, n_mlp_examples, sampler, **cache_params)
     test_ds = load_or_generate_factual("test", test_causal_model, n_test_examples, sampler, **cache_params)
-    train_dataset = load_or_generate_counterfactual("train", train_causal_model, n_train_examples, das_batch_size, sampler, **cache_params)
+    train_dataset = load_or_generate_counterfactual("train", train_causal_model, n_probe_examples, das_batch_size, sampler, **cache_params)
     test_dataset = load_or_generate_counterfactual("test", test_causal_model, n_test_examples, das_batch_size, sampler, **cache_params)
+    # import ipdb; ipdb.set_trace()
 
     print("\n=== Training and Evaluating MLP on Hierarchical Equality ===")
-    trained, trainer = train_mlp(train_ds, test_ds, embedding_dim, epochs=3)
+    trained, trainer = train_mlp(train_ds, test_ds, embedding_dim, epochs=5)
     test_preds = trainer.predict(test_ds)
     y_test = np.array(test_ds["labels"]).argmax(1)
     print("Trained MLP factual accuracy:")
     print(classification_report(y_test, test_preds[0].argmax(1)))
+
+    print("\n=== Diagnostic Probe Experiment ===")
+    run_probe_experiment(trained, train_ds, test_ds, embedding_dim, device=device)
 
     print("\n=== Distributed Alignment Search ===")
     intervenable = build_das_intervenable(trained, device)
