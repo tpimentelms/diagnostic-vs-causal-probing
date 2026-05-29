@@ -325,6 +325,16 @@ class BatchedRandomSampler(Sampler):
         return self.n_batches * self.batch_size
 
 
+def get_batched_sampler(batch_size):
+    def batched_random_sampler(data):
+        batch_indices = [_ for _ in range(int(len(data) / batch_size))]
+        random.shuffle(batch_indices)
+        for b_i in batch_indices:
+            for i in range(b_i * batch_size, (b_i + 1) * batch_size):
+                yield i
+    return batched_random_sampler
+
+
 def build_das_intervenable(model, device):
     config = IntervenableConfig(
         model_type=type(model),
@@ -346,33 +356,33 @@ def _run_intervenable_batch(intervenable, batch, embedding_dim):
     batch_size = batch["input_ids"].shape[0]
     wx_subspace = [[_ for _ in range(0, embedding_dim * 2)]] * batch_size
     yz_subspace = [[_ for _ in range(embedding_dim * 2, embedding_dim * 4)]] * batch_size
-    pos = [[[0]] * batch_size]
+    pos = [[[[0]] * batch_size] for _ in range(4)]
 
     if batch["intervention_id"][0] == 2:
         return intervenable(
             {"inputs_embeds": batch["input_ids"]},
             [{"inputs_embeds": batch["source_input_ids"][:, 0]},
              {"inputs_embeds": batch["source_input_ids"][:, 1]}],
-            {"sources->base": (pos + pos, pos + pos)},
+            {"sources->base": (pos[0] + pos[1], pos[2] + pos[3])},
             subspaces=[wx_subspace, yz_subspace],
         )
     elif batch["intervention_id"][0] == 0:
         return intervenable(
             {"inputs_embeds": batch["input_ids"]},
             [{"inputs_embeds": batch["source_input_ids"][:, 0]}, None],
-            {"sources->base": (pos + [None], pos + [None])},
+            {"sources->base": (pos[0] + [None], pos[1] + [None])},
             subspaces=[wx_subspace, None],
         )
-    else:
+    elif batch["intervention_id"][0] == 1:
         return intervenable(
             {"inputs_embeds": batch["input_ids"]},
             [None, {"inputs_embeds": batch["source_input_ids"][:, 0]}],
-            {"sources->base": ([None] + pos, [None] + pos)},
+            {"sources->base": ([None] + pos[0], [None] + pos[1])},
             subspaces=[None, yz_subspace],
         )
 
 
-def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10, device="cpu"):
+def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10, accumulation_steps=1, device="cpu"):
     optimizer_params = []
     for k, v in intervenable.interventions.items():
         optimizer_params += [{"params": v.rotate_layer.parameters()}]
@@ -382,12 +392,14 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10, 
 
     intervenable.model.train()
     print("Trainable intervention parameters:", intervenable.count_parameters())
+    print(f"Effective batch size: {batch_size * accumulation_steps}")
 
-    step = 0
+    total_steps = 1
     for epoch in trange(epochs, desc="Epoch"):
-        sampler = BatchedRandomSampler(len(dataset), batch_size)
-        epoch_iter = tqdm(DataLoader(dataset, batch_size=batch_size, sampler=sampler), desc=f"Epoch {epoch}", leave=True)
-        for batch in epoch_iter:
+        sampler = get_batched_sampler(batch_size)
+        epoch_iter = tqdm(DataLoader(dataset, batch_size=batch_size, sampler=sampler(dataset)), desc=f"Epoch {epoch}", leave=True)
+        total_loss, total_acc = 0, 0
+        for i, batch in enumerate(epoch_iter):
             batch["input_ids"] = batch["input_ids"].unsqueeze(1)
             batch["source_input_ids"] = batch["source_input_ids"].unsqueeze(2)
             for k, v in batch.items():
@@ -398,14 +410,29 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10, 
             labels = batch["labels"].squeeze().to(torch.long)
             loss = ce_loss(outputs[0], labels)
             acc = (outputs[0].argmax(1) == labels).float().mean().item()
-            epoch_iter.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{acc:.4f}"})
+
+            total_loss += loss.item()
+            total_acc += acc
+
+            epoch_iter.set_postfix({"loss": f"{(total_loss/(i+1)):.4f}", "acc": f"{(total_acc/(i+1)):.4f}"})
             if wandb.run is not None:
                 wandb.log({"das/loss": loss.item(), "das/acc": acc, "das/step": step})
 
-            loss.backward()
-            optimizer.step()
-            intervenable.set_zero_grad()
-            step += 1
+            (loss / accumulation_steps).backward()
+
+            if total_steps == 50000:
+                import ipdb; ipdb.set_trace()
+
+            if total_steps % accumulation_steps == 0:
+                optimizer.step()
+                intervenable.set_zero_grad()
+            total_steps += 1
+
+        # # flush remaining accumulated gradients at end of epoch
+        # if (i + 1) % accumulation_steps != 0:
+        #     optimizer.step()
+        #     intervenable.set_zero_grad()
+        #     step += 1
 
 
 def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, device="cpu"):
@@ -498,9 +525,9 @@ def main(args):
     # eval_factual(handcrafted, hc_causal_model, hc_causal_model.sample_input_tree_balanced, prefix="handcrafted")
 
     print("\n=== Generating or Loading Data for Hierarchical Equality ===")
-    embedding_dim, n_mlp_examples, n_test_examples, das_batch_size = 4, 2**20, 10000, 6400
-    n_das_train_examples = 10 * das_batch_size   # 1,280,000 — matches tutorial; ~67 blocks of each type
-    n_das_test_examples = 3 * das_batch_size       # 19,200 — minimum for all 3 intervention types
+    embedding_dim, n_mlp_examples, n_test_examples, das_batch_size = 4, 2**20, 10000, 640
+    n_das_train_examples = 200 * 6400   # 1,280,000 — ~200 effective optimizer steps/epoch regardless of das_batch_size
+    n_das_test_examples = 3 * 6400       # 19,200 — one block of each intervention type
     n_train_entities, n_test_entities = 100, 100
     sampler = make_input_sampler(embedding_dim)
     train_causal_model = build_causal_model(embedding_dim, n_entities=n_train_entities)
@@ -509,8 +536,9 @@ def main(args):
     cache_params = dict(dim=embedding_dim, seed=args.seed, nentities=n_train_entities)
     train_ds = load_or_generate_factual("train", train_causal_model, n_mlp_examples, sampler, **cache_params)
     test_ds = load_or_generate_factual("test", test_causal_model, n_test_examples, sampler, **cache_params)
-    train_dataset = load_or_generate_counterfactual("train", train_causal_model, n_das_train_examples, das_batch_size, sampler, **cache_params)
-    test_dataset = load_or_generate_counterfactual("test", test_causal_model, n_das_test_examples, das_batch_size, sampler, **cache_params)
+    cf_cache_params = dict(dim=embedding_dim, seed=args.seed, nentities=n_train_entities, bs=das_batch_size)
+    train_dataset = load_or_generate_counterfactual("train", train_causal_model, n_das_train_examples, das_batch_size, sampler, **cf_cache_params)
+    test_dataset = load_or_generate_counterfactual("test", test_causal_model, n_das_test_examples, das_batch_size, sampler, **cf_cache_params)
     # import ipdb; ipdb.set_trace()
 
     print("\n=== Training and Evaluating MLP on Hierarchical Equality ===")
@@ -523,12 +551,13 @@ def main(args):
     print("Trained MLP factual accuracy:")
     print(classification_report(y_test, test_logits.argmax(1).cpu().numpy()))
 
-    print("\n=== Diagnostic Probe Experiment ===")
-    run_probe_experiment(trained, train_ds, test_ds, embedding_dim, device=device)
+    # print("\n=== Diagnostic Probe Experiment ===")
+    # run_probe_experiment(trained, train_ds, test_ds, embedding_dim, device=device)
 
     print("\n=== Distributed Alignment Search ===")
     intervenable = build_das_intervenable(trained, device)
-    train_das(intervenable, train_dataset, embedding_dim, batch_size=das_batch_size, device=device)
+    accumulation_steps = 6400 // das_batch_size
+    train_das(intervenable, train_dataset, embedding_dim, batch_size=das_batch_size, epochs=100, accumulation_steps=accumulation_steps, device=device)
     print("DAS counterfactual accuracy:")
     eval_das(intervenable, test_dataset, embedding_dim, batch_size=das_batch_size, device=device)
 
