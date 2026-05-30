@@ -350,6 +350,14 @@ def build_das_intervenable(model, device):
     return intervenable
 
 
+def handcraft_das(intervenable, embedding_dim):
+    n = embedding_dim * 4  # = 8
+    with torch.no_grad():
+        for k, v in intervenable.interventions.items():
+            v.rotate_layer.parametrizations.weight[0].base.copy_(torch.eye(n))
+            v.rotate_layer.parametrizations.weight.original.data.copy_(-torch.eye(n))
+            break  # shared rotation, only set once
+
 def _run_intervenable_batch(intervenable, batch, embedding_dim):
     assert batch["intervention_id"].unique().numel() == 1, \
         "All examples in a batch must share the same intervention_id"
@@ -382,12 +390,16 @@ def _run_intervenable_batch(intervenable, batch, embedding_dim):
         )
 
 
-def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10, accumulation_steps=1, device="cpu"):
+def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10, accumulation_steps=1, lr=0.001, warmup_steps=100, device="cpu"):
     optimizer_params = []
     for k, v in intervenable.interventions.items():
         optimizer_params += [{"params": v.rotate_layer.parameters()}]
         break
-    optimizer = torch.optim.Adam(optimizer_params, lr=0.001)
+    optimizer = torch.optim.Adam(optimizer_params, lr=lr)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: min(1.0, (step + 1) / max(1, warmup_steps)),
+    )
     ce_loss = torch.nn.CrossEntropyLoss()
 
     intervenable.model.train()
@@ -395,6 +407,7 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10, 
     print(f"Effective batch size: {batch_size * accumulation_steps}")
 
     total_steps = 1
+    optimizer_steps = 0
     for epoch in trange(epochs, desc="Epoch"):
         sampler = get_batched_sampler(batch_size)
         epoch_iter = tqdm(DataLoader(dataset, batch_size=batch_size, sampler=sampler(dataset)), desc=f"Epoch {epoch}", leave=True)
@@ -416,23 +429,16 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10, 
 
             epoch_iter.set_postfix({"loss": f"{(total_loss/(i+1)):.4f}", "acc": f"{(total_acc/(i+1)):.4f}"})
             if wandb.run is not None:
-                wandb.log({"das/loss": loss.item(), "das/acc": acc, "das/step": step})
+                wandb.log({"das/loss": loss.item(), "das/acc": acc, "das/step": total_steps})
 
             (loss / accumulation_steps).backward()
 
-            if total_steps == 50000:
-                import ipdb; ipdb.set_trace()
-
             if total_steps % accumulation_steps == 0:
                 optimizer.step()
+                scheduler.step()
                 intervenable.set_zero_grad()
+                optimizer_steps += 1
             total_steps += 1
-
-        # # flush remaining accumulated gradients at end of epoch
-        # if (i + 1) % accumulation_steps != 0:
-        #     optimizer.step()
-        #     intervenable.set_zero_grad()
-        #     step += 1
 
 
 def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, device="cpu"):
@@ -516,17 +522,19 @@ def main(args):
         )
 
     device = get_device(args.device)
+    # device = 'cpu'
     print(f"Using device: {device}")
 
     # print("\n=== Handcrafted MLP ===")
     # hc_causal_model = build_causal_model(embedding_dim=2)
-    # handcrafted = build_handcrafted_mlp(embedding_dim=2)
+    # n_layers = 2
+    # trained = build_handcrafted_mlp(embedding_dim=2).to(device)
     # print("Factual accuracy:")
     # eval_factual(handcrafted, hc_causal_model, hc_causal_model.sample_input_tree_balanced, prefix="handcrafted")
 
     print("\n=== Generating or Loading Data for Hierarchical Equality ===")
     embedding_dim, n_mlp_examples, n_test_examples, das_batch_size = 4, 2**20, 10000, 640
-    n_das_train_examples = 200 * 6400   # 1,280,000 — ~200 effective optimizer steps/epoch regardless of das_batch_size
+    n_das_train_examples = 100 * 6400   # 1,280,000 — ~200 effective optimizer steps/epoch regardless of das_batch_size
     n_das_test_examples = 3 * 6400       # 19,200 — one block of each intervention type
     n_train_entities, n_test_entities = 100, 100
     sampler = make_input_sampler(embedding_dim)
@@ -539,10 +547,10 @@ def main(args):
     cf_cache_params = dict(dim=embedding_dim, seed=args.seed, nentities=n_train_entities, bs=das_batch_size)
     train_dataset = load_or_generate_counterfactual("train", train_causal_model, n_das_train_examples, das_batch_size, sampler, **cf_cache_params)
     test_dataset = load_or_generate_counterfactual("test", test_causal_model, n_das_test_examples, das_batch_size, sampler, **cf_cache_params)
-    # import ipdb; ipdb.set_trace()
 
     print("\n=== Training and Evaluating MLP on Hierarchical Equality ===")
-    trained = load_or_train_mlp(train_ds, test_ds, embedding_dim, n_mlp_examples, epochs=5, device=device, **cache_params)
+    n_layers = 3
+    trained = load_or_train_mlp(train_ds, test_ds, embedding_dim, n_mlp_examples, epochs=10, device=device, **cache_params)
     trained.eval()
     with torch.no_grad():
         test_inputs = torch.tensor(np.array(test_ds["inputs_embeds"]), dtype=torch.float32).to(device)
@@ -551,13 +559,15 @@ def main(args):
     print("Trained MLP factual accuracy:")
     print(classification_report(y_test, test_logits.argmax(1).cpu().numpy()))
 
-    # print("\n=== Diagnostic Probe Experiment ===")
-    # run_probe_experiment(trained, train_ds, test_ds, embedding_dim, device=device)
+    print("\n=== Diagnostic Probe Experiment ===")
+    run_probe_experiment(trained, train_ds, test_ds, embedding_dim, n_layers=n_layers, device=device)
 
     print("\n=== Distributed Alignment Search ===")
     intervenable = build_das_intervenable(trained, device)
     accumulation_steps = 6400 // das_batch_size
-    train_das(intervenable, train_dataset, embedding_dim, batch_size=das_batch_size, epochs=10, accumulation_steps=accumulation_steps, device=device)
+    # accumulation_steps = 5
+    # handcraft_das(intervenable, embedding_dim)
+    train_das(intervenable, train_dataset, embedding_dim, batch_size=das_batch_size, epochs=20, accumulation_steps=accumulation_steps, device=device)
     print("DAS counterfactual accuracy:")
     eval_das(intervenable, test_dataset, embedding_dim, batch_size=das_batch_size, device=device)
 
