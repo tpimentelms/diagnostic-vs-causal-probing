@@ -29,12 +29,14 @@ def mlp_config(embedding_dim, n_layer=3):
 
 # ── Scaling-experiment sweeps ───────────────────────────────────────────────
 
-# (n_total_examples, das_batch_size) pairs for the DAS scaling sweep.
-# Each n must be divisible by batch_size * 3 (one block per intervention type).
-DAS_SCALE_CONFIGS = [
-    (30, 10), (90, 30), (300, 100), (960, 320),
-    (1920, 640), (6400, 640), (19200, 640),
-]
+# Shared dataset sizes (n) for BOTH the probing and DAS scaling sweeps, so the two
+# methods are compared on the same x-axis.
+SCALE_N = [30, 90, 300, 960, 1920, 6400, 19200]
 
-# Training-set sizes for the diagnostic-probe scaling sweep.
-PROBE_SCALE_N = [10, 32, 100, 320, 1000, 3200, 10000]
+# DAS additionally needs a batch size per n: the counterfactual data is stored in
+# contiguous blocks of `batch_size`, each holding a single intervention type, so n
+# must be a multiple of batch_size (and n // batch_size a multiple of 3 to balance
+# the three types).
+DAS_SCALE_CONFIGS = [(30, 10), (90, 30), (300, 100), (960, 320),
+                     (1920, 640), (6400, 640), (19200, 640)]
+assert [n for n, _ in DAS_SCALE_CONFIGS] == SCALE_N, "DAS sizes must match SCALE_N"

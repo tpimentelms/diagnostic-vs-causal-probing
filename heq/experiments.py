@@ -13,7 +13,7 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from tqdm import tqdm
 
-from heq.config import DAS_SCALE_CONFIGS, PROBE_SCALE_N
+from heq.config import DAS_SCALE_CONFIGS, SCALE_N
 from heq.das import build_das_intervenable, eval_das, reset_das_rotation, train_das
 from heq.data import load_or_generate_counterfactual
 from heq.probing import collect_activations, probe_labels
@@ -24,7 +24,7 @@ DAS_TARGET_UPDATES = 5000
 
 
 def run_probe_scaling(model, train_ds, test_ds, embedding_dim,
-                      n_values=PROBE_SCALE_N, layer_idx=0, device="cpu"):
+                      n_values=SCALE_N, layer_idx=0, device="cpu"):
     """Probe train-fit (capacity) and test accuracy vs n, on correct and random labels."""
     train_acts = collect_activations(model, train_ds, layer_idx, device=device)
     test_acts = collect_activations(model, test_ds, layer_idx, device=device)
@@ -103,40 +103,30 @@ def run_das_scaling(trained, train_causal_model, test_dataset, embedding_dim,
 
 
 def plot_scaling_experiment(probe_results, das_results, save_path="scaling.png"):
+    """Train-set fit vs n, with the probe and DAS on the same axes, split into one
+    panel for correct labels (signal) and one for random labels (spurious capacity).
+    """
     import matplotlib.pyplot as plt
 
-    n_probe = PROBE_SCALE_N[:len(probe_results["WX"]["correct"]["train"])]
-    n_das = [cfg[0] for cfg in DAS_SCALE_CONFIGS[:len(das_results["correct"]["train"])]]
+    n_probe = SCALE_N[:len(probe_results["WX"]["correct"]["train"])]
+    n_das = SCALE_N[:len(das_results["correct"]["train"])]
 
     colors = {"WX": "#1f77b4", "YZ": "#ff7f0e", "DAS": "#2ca02c"}
     _, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
 
-    probe_items = [
-        ("WX – correct (train)", colors["WX"], "-",  probe_results["WX"]["correct"]["train"]),
-        ("WX – random (train)",  colors["WX"], "--", probe_results["WX"]["random"]["train"]),
-        ("YZ – correct (train)", colors["YZ"], "-",  probe_results["YZ"]["correct"]["train"]),
-        ("YZ – random (train)",  colors["YZ"], "--", probe_results["YZ"]["random"]["train"]),
-    ]
-    das_items = [
-        ("DAS – correct (train)", colors["DAS"], "-",  das_results["correct"]["train"]),
-        ("DAS – random (train)",  colors["DAS"], "--", das_results["random"]["train"]),
-        ("DAS – correct (test)",  colors["DAS"], ":",  das_results["correct"]["test"]),
-    ]
-
-    for ax, (title, n_vals, items) in zip(axes, [
-        ("Linear Probe (Layer 0)", n_probe, probe_items),
-        ("DAS (linear)", n_das, das_items),
-    ]):
-        for label, color, ls, vals in items:
-            ax.plot(n_vals, vals, marker="o", color=color, linestyle=ls, label=label)
+    for ax, key, title in [(axes[0], "correct", "Correct labels (signal)"),
+                           (axes[1], "random", "Random labels (spurious capacity)")]:
+        ax.plot(n_probe, probe_results["WX"][key]["train"], marker="o", color=colors["WX"], label="Probe – WX")
+        ax.plot(n_probe, probe_results["YZ"][key]["train"], marker="o", color=colors["YZ"], label="Probe – YZ")
+        ax.plot(n_das, das_results[key]["train"], marker="s", color=colors["DAS"], label="DAS")
         ax.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="Chance")
         ax.set_xscale("log")
         ax.set_xlabel("Training examples (n)")
-        ax.set_ylabel("Train-set fit (accuracy)")
         ax.set_title(title)
         ax.set_ylim(0.4, 1.02)
         ax.legend(fontsize=9)
         ax.grid(True, which="both", alpha=0.3)
+    axes[0].set_ylabel("Train-set fit (accuracy)")
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
