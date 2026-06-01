@@ -220,3 +220,20 @@ __marimo__/
 # Generated cache and trainer output
 cache/
 test_trainer/
+wandb/
+
+# macOS
+.DS_Store
+
+# Editor swap/backup files (e.g. main.py.tmp.20020.87e4f938b883)
+*.tmp.*
+
+# LaTeX build artifacts (keep .tex, .bib and .pdf)
+report/*.aux
+report/*.bbl
+report/*.blg
+report/*.out
+report/*.toc
+report/*.fls
+report/*.fdb_latexmk
+report/*.synctex.gz
