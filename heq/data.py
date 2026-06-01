@@ -24,19 +24,17 @@ def randvec(n, lower=-1, upper=1):
 
 
 def build_causal_model(embedding_dim, n_entities=20):
-    variables = ["W", "X", "Y", "Z", "WX", "YZ", "O"]
+    variables = ["W", "X", "Y", "Z", "WX", "O"]
     reps = [randvec(embedding_dim) for _ in range(n_entities)]
 
     values = {var: reps for var in ["W", "X", "Y", "Z"]}
     values["WX"] = [True, False]
-    values["YZ"] = [True, False]
     values["O"] = [True, False]
 
     parents = {
         "W": [], "X": [], "Y": [], "Z": [],
         "WX": ["W", "X"],
-        "YZ": ["Y", "Z"],
-        "O": ["WX", "YZ"],
+        "O": ["WX", "Y", "Z"],
     }
 
     def filler():
@@ -45,8 +43,7 @@ def build_causal_model(embedding_dim, n_entities=20):
     functions = {
         "W": filler, "X": filler, "Y": filler, "Z": filler,
         "WX": lambda x, y: np.array_equal(x, y),
-        "YZ": lambda x, y: np.array_equal(x, y),
-        "O": lambda x, y: x == y,
+        "O": lambda x, y, z: x == np.array_equal(y, z),
     }
 
     return CausalModel(variables, values, parents, functions)
@@ -70,27 +67,28 @@ def make_input_sampler(embedding_dim):
             else:
                 choices = [{"W": A, "X": B, "Y": C, "Z": D},
                            {"W": A, "X": B, "Y": C, "Z": C}]
-        elif output_var == "YZ":
-            if output_var_value:
-                choices = [{"W": A, "X": B, "Y": C, "Z": C},
-                           {"W": A, "X": A, "Y": C, "Z": C}]
-            else:
-                choices = [{"W": A, "X": B, "Y": C, "Z": D},
-                           {"W": A, "X": A, "Y": C, "Z": D}]
         else:
-            raise ValueError(f"Unknown output_var: {output_var!r}")
+            # WX-only setup: we never request YZ (or any other) sources, so fail
+            # loudly if that assumption is ever violated.
+            raise ValueError(f"Unsupported output_var: {output_var!r} (WX-only setup)")
 
         return random.choice(choices)
 
     return sampler
 
 
+def sample_wx_intervention():
+    """Sample a WX-only intervention---the single intervention type we use.
+
+    Only WX is ever set (never YZ); the base supplies YZ, so the counterfactual
+    label O = (WX == YZ) stays balanced within a batch.
+    """
+    return {"WX": random.choice([True, False])}
+
+
 def intervention_id(intervention):
-    if "WX" in intervention and "YZ" in intervention:
-        return 2
-    if "WX" in intervention:
-        return 0
-    return 1
+    # WX-only setup: there is a single intervention type.
+    return 0
 
 
 # ── Caching ─────────────────────────────────────────────────────────────────
@@ -132,13 +130,17 @@ def _pyvene_cf_to_hf_dataset(dataset):
 
 
 def load_or_generate_counterfactual(name, causal_model, n_examples, batch_size, sampler, **cache_params):
-    path = cache_path(f"{name}_counterfactual", n_examples, **cache_params)
+    # "_wx" marks WX-only data so the cache is not confused with older 3-type data.
+    path = cache_path(f"{name}_counterfactual_wx", n_examples, **cache_params)
     if path.exists():
         print(f"Loading {name} counterfactual dataset from {path}")
         return Dataset.load_from_disk(str(path)).with_format("torch")
     CACHE_DIR.mkdir(exist_ok=True)
     print(f"Generating {name} counterfactual dataset ({n_examples} examples)...")
-    dataset = causal_model.generate_counterfactual_dataset(n_examples, intervention_id, batch_size, sampler=sampler)
+    dataset = causal_model.generate_counterfactual_dataset(
+        n_examples, intervention_id, batch_size,
+        sampler=sampler, intervention_sampler=sample_wx_intervention,
+    )
     hf_ds = _pyvene_cf_to_hf_dataset(dataset)
     hf_ds.save_to_disk(str(path))
     return hf_ds.with_format("torch")
