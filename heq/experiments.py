@@ -32,11 +32,11 @@ def run_probe_scaling(model, train_ds, test_ds, embedding_dim,
     test_labels = probe_labels(test_ds, embedding_dim)
 
     results = {concept: {"correct": {"train": [], "test": []},
-                         "random":  {"train": [], "test": []}} for concept in ["WX", "YZ"]}
+                         "random":  {"train": [], "test": []}} for concept in ["WX"]}
     for n in n_values:
         idx = np.random.choice(len(train_acts), min(n, len(train_acts)), replace=False)
         acts = train_acts[idx]
-        for concept in ["WX", "YZ"]:
+        for concept in ["WX"]:
             true_labels = train_labels[concept][idx]
             rand_labels = np.random.permutation(true_labels)  # fixed random labelling for this n
             for key, lbls in [("correct", true_labels), ("random", rand_labels)]:
@@ -111,14 +111,13 @@ def plot_scaling_experiment(probe_results, das_results, save_path="scaling.png")
     n_probe = SCALE_N[:len(probe_results["WX"]["correct"]["train"])]
     n_das = SCALE_N[:len(das_results["correct"]["train"])]
 
-    colors = {"WX": "#1f77b4", "YZ": "#ff7f0e", "DAS": "#2ca02c"}
+    colors = {"WX": "#1f77b4", "DAS": "#2ca02c"}
     _, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
 
     for ax, key, title in [(axes[0], "correct", "Correct labels (signal)"),
                            (axes[1], "random", "Random labels (spurious capacity)")]:
         ax.plot(n_probe, probe_results["WX"][key]["train"], marker="o", color=colors["WX"], label="Probe – WX")
-        ax.plot(n_probe, probe_results["YZ"][key]["train"], marker="o", color=colors["YZ"], label="Probe – YZ")
-        ax.plot(n_das, das_results[key]["train"], marker="s", color=colors["DAS"], label="DAS")
+        ax.plot(n_das, das_results[key]["train"], marker="s", color=colors["DAS"], label="DAS – WX")
         ax.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="Chance")
         ax.set_xscale("log")
         ax.set_xlabel("Training examples (n)")

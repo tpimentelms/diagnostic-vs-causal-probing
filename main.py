@@ -148,10 +148,7 @@ def main(args):
             train_dataset = filter_intervention_type(train_dataset, args.das_only_type)
             print(f"[debug] training on intervention type {args.das_only_type} only: "
                   f"{len(train_dataset)} examples")
-        # use_fast is correct only for single-location interventions (types 0/1); type 2
-        # needs the slow path. Enable the fast path when debugging a single type 0/1.
-        das_use_fast = args.das_only_type in (0, 1)
-        intervenable = build_das_intervenable(trained, device, use_fast=das_use_fast)
+        intervenable = build_das_intervenable(trained, device)
         accumulation_steps = args.das_accumulation or max(1, 6400 // args.das_batch_size)
         train_das(intervenable, train_dataset, dim, batch_size=args.das_batch_size,
                   epochs=args.das_epochs, accumulation_steps=accumulation_steps,
