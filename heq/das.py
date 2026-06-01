@@ -109,6 +109,8 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
         rotation_params = list(v.rotate_layer.parameters())
         break
     optimizer = torch.optim.Adam(rotation_params, lr=lr)
+    # Snapshot the rotation at init so we can verify it is actually being updated.
+    rot_init = [p.detach().clone() for p in rotation_params]
 
     # Warmup then cosine decay. Holding lr flat after warmup made the rotation
     # overshoot once it reached a good (and, with a confident MLP, sharp) alignment,
@@ -132,6 +134,7 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
 
     total_steps = 1
     optimizer_steps = 0
+    grad_norm = float("nan")
     epoch_iter_outer = trange(epochs, desc="Epoch") if verbose else range(epochs)
     for epoch in epoch_iter_outer:
         sampler = get_batched_sampler(batch_size)
@@ -177,27 +180,31 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
             (loss / accumulation_steps).backward()
 
             if total_steps % accumulation_steps == 0:
-                if grad_clip:
-                    torch.nn.utils.clip_grad_norm_(rotation_params, grad_clip)
+                # clip_grad_norm_ returns the pre-clip total norm — use it as a probe of
+                # whether any gradient is actually reaching the rotation.
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    rotation_params, grad_clip if grad_clip else float("inf")).item()
                 optimizer.step()
                 scheduler.step()
                 intervenable.set_zero_grad()
                 optimizer_steps += 1
             total_steps += 1
 
-            # Periodic clean evaluation: order-independent, averaged over all types — the
-            # number to actually trust (unlike the within-epoch running means above).
-            if eval_dataset is not None and (epoch % eval_every == 0 or epoch == epochs - 1):
-                eval_acc, eval_pt = eval_das(intervenable, eval_dataset, embedding_dim,
-                                            batch_size=eval_batch_size, verbose=False,
-                                            device=device, return_per_type=True)
-                intervenable.model.train()  # eval_das switched to eval(); resume training
-                if verbose:
-                    pt = " ".join(f"t{t}={a:.3f}" for t, a in sorted(eval_pt.items()))
-                    print(f"[epoch {epoch}] eval IIA={eval_acc:.4f}  per-type {pt}")
-                if wandb.run is not None:
-                    wandb.log({"das/eval_acc_epoch": eval_acc, "das/epoch": epoch,
-                            **{f"das/eval_acc_type{t}": a for t, a in eval_pt.items()}})
+        # Periodic clean evaluation: order-independent, averaged over all types — the
+        # number to actually trust (unlike the within-epoch running means above).
+        if eval_dataset is not None and (epoch % eval_every == 0 or epoch == epochs - 1):
+            eval_acc, eval_pt = eval_das(intervenable, eval_dataset, embedding_dim,
+                                        batch_size=eval_batch_size, verbose=False,
+                                        device=device, return_per_type=True)
+            intervenable.model.train()  # eval_das switched to eval(); resume training
+            if verbose:
+                pt = " ".join(f"t{t}={a:.3f}" for t, a in sorted(eval_pt.items()))
+                rot_delta = sum((p - p0).norm().item() for p, p0 in zip(rotation_params, rot_init))
+                print(f"[epoch {epoch}] eval IIA={eval_acc:.4f}  per-type {pt}  "
+                        f"|grad|={grad_norm:.2e}  Δrot={rot_delta:.2e}")
+            if wandb.run is not None:
+                wandb.log({"das/eval_acc_epoch": eval_acc, "das/epoch": epoch,
+                        **{f"das/eval_acc_type{t}": a for t, a in eval_pt.items()}})
 
 
 def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, verbose=True,
