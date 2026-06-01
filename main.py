@@ -82,6 +82,9 @@ def get_args():
     parser.add_argument("--das-epochs", type=int, default=20)
     parser.add_argument("--das-lr", type=float, default=0.001)
     parser.add_argument("--das-warmup", type=int, default=100, help="DAS warmup in optimizer steps")
+    parser.add_argument("--das-accumulation", type=int, default=0,
+                        help="DAS grad-accumulation steps; 0 = auto (effective batch ~6400). "
+                             "Set 1 to update every minibatch (10x more updates at batch 640).")
     # Logging.
     parser.add_argument("--wandb-project", type=str, default="das-hierarchical-equality")
     parser.add_argument("--wandb-run-name", type=str, default=None)
@@ -138,7 +141,7 @@ def main(args):
     if "das" in steps:
         print("\n=== Distributed Alignment Search ===")
         intervenable = build_das_intervenable(trained, device)
-        accumulation_steps = 6400 // args.das_batch_size
+        accumulation_steps = args.das_accumulation or max(1, 6400 // args.das_batch_size)
         train_das(intervenable, train_dataset, dim, batch_size=args.das_batch_size,
                   epochs=args.das_epochs, accumulation_steps=accumulation_steps,
                   lr=args.das_lr, warmup_steps=args.das_warmup, device=device)
