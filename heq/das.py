@@ -32,7 +32,9 @@ def build_das_intervenable(model, device):
         ],
         intervention_types=RotatedSpaceIntervention,
     )
-    intervenable = IntervenableModel(config, model, use_fast=True)
+    # use_fast=False: the fast path keeps only the *first* location tag, which
+    # silently drops the second source in type-2 (both-subspace) interventions.
+    intervenable = IntervenableModel(config, model, use_fast=False)
     intervenable.set_device(device)
     intervenable.disable_model_gradients()
     return intervenable
