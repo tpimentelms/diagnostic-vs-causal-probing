@@ -1,9 +1,9 @@
 """Distributed Alignment Search (DAS) with a linear (rotation) alignment map.
 
-We learn an orthogonal map onto the MLP's hidden space, intervene on the WX and
-YZ subspaces in that rotated basis, and measure the interchange-intervention
-accuracy with which the (frozen) MLP reproduces the target algorithm's
-counterfactual outputs.
+We learn an orthogonal map onto the MLP's hidden space, intervene on the WX
+subspace in that rotated basis, and measure the interchange-intervention accuracy
+with which the (frozen) MLP reproduces the target algorithm's counterfactual
+outputs.
 """
 
 import math

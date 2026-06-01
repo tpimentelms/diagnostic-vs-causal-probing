@@ -2,8 +2,8 @@
 (cached) factual / counterfactual datasets used to train the MLP and DAS.
 
 The task asks whether two pairs of vectors are *both* equal or *both* unequal:
-``O = (W == X) == (Y == Z)``. The intermediate variables ``WX`` and ``YZ`` are
-the ground-truth concepts a probe or alignment map ought to recover.
+``O = (W == X) == (Y == Z)``. We keep ``WX`` as the single intermediate node and the
+one concept we probe and intervene on; ``Y == Z`` is folded directly into ``O``.
 """
 
 import random
@@ -144,14 +144,3 @@ def load_or_generate_counterfactual(name, causal_model, n_examples, batch_size, 
     hf_ds = _pyvene_cf_to_hf_dataset(dataset)
     hf_ds.save_to_disk(str(path))
     return hf_ds.with_format("torch")
-
-
-def filter_intervention_type(dataset, tid):
-    """Subset a counterfactual dataset to a single intervention type (0/1/2)."""
-    # Read the column straight from Arrow. Indexing a column on a torch-formatted
-    # dataset runs the formatter row-by-row (~6s per 200k rows); to_numpy() is ~300x
-    # faster. Call sites pass a freshly loaded dataset (no indices mapping), so the
-    # Arrow column order matches the dataset order.
-    ids = dataset.data.column("intervention_id").to_numpy()
-    idx = np.where(ids == tid)[0]
-    return dataset.select(idx).with_format("torch")
