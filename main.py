@@ -74,7 +74,7 @@ def get_args():
     parser.add_argument("--n-mlp-examples", type=int, default=2 ** 20)
     parser.add_argument("--n-test-examples", type=int, default=10000)
     parser.add_argument("--das-batch-size", type=int, default=640)
-    parser.add_argument("--n-das-train-examples", type=int, default=100 * 6400)  # ~200 opt. steps/epoch
+    parser.add_argument("--n-das-train-examples", type=int, default=200 * 6400)  # ~200 opt. steps/epoch
     parser.add_argument("--n-das-test-examples", type=int, default=3 * 6400)     # one block per intervention type
     parser.add_argument("--mlp-epochs", type=int, default=10)
     parser.add_argument("--das-epochs", type=int, default=20)
