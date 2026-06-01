@@ -77,7 +77,11 @@ def get_args():
     parser.add_argument("--n-das-train-examples", type=int, default=200 * 6400)  # ~200 opt. steps/epoch
     parser.add_argument("--n-das-test-examples", type=int, default=3 * 6400)     # one block per intervention type
     parser.add_argument("--mlp-epochs", type=int, default=10)
+    parser.add_argument("--mlp-weight-decay", type=float, default=0.01,
+                        help="weight decay for MLP training; higher => less over-confident logits")
     parser.add_argument("--das-epochs", type=int, default=20)
+    parser.add_argument("--das-lr", type=float, default=0.001)
+    parser.add_argument("--das-warmup", type=int, default=100, help="DAS warmup in optimizer steps")
     # Logging.
     parser.add_argument("--wandb-project", type=str, default="das-hierarchical-equality")
     parser.add_argument("--wandb-run-name", type=str, default=None)
@@ -117,7 +121,8 @@ def main(args):
 
     print("\n=== Training and Evaluating MLP on Hierarchical Equality ===")
     trained = load_or_train_mlp(train_ds, test_ds, dim, args.n_mlp_examples,
-                                epochs=args.mlp_epochs, device=device, **cache_params)
+                                epochs=args.mlp_epochs, weight_decay=args.mlp_weight_decay,
+                                device=device, **cache_params)
     trained.eval()
     with torch.no_grad():
         test_inputs = torch.tensor(np.array(test_ds["inputs_embeds"]), dtype=torch.float32).to(device)
@@ -135,7 +140,8 @@ def main(args):
         intervenable = build_das_intervenable(trained, device)
         accumulation_steps = 6400 // args.das_batch_size
         train_das(intervenable, train_dataset, dim, batch_size=args.das_batch_size,
-                  epochs=args.das_epochs, accumulation_steps=accumulation_steps, device=device)
+                  epochs=args.das_epochs, accumulation_steps=accumulation_steps,
+                  lr=args.das_lr, warmup_steps=args.das_warmup, device=device)
         print("DAS counterfactual accuracy:")
         eval_das(intervenable, test_dataset, dim, batch_size=args.das_batch_size, device=device)
 
