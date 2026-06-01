@@ -100,7 +100,8 @@ def _run_intervenable_batch(intervenable, batch, embedding_dim):
 
 def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
               accumulation_steps=1, lr=0.001, warmup_steps=100, grad_clip=1.0,
-              randomize_labels=False, verbose=True, device="cpu"):
+              randomize_labels=False, eval_dataset=None, eval_batch_size=640,
+              eval_every=1, verbose=True, device="cpu"):
     rotation_params = []
     for k, v in intervenable.interventions.items():
         rotation_params = list(v.rotate_layer.parameters())
@@ -134,8 +135,14 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
         sampler = get_batched_sampler(batch_size)
         loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler(dataset))
         epoch_iter = tqdm(loader, desc=f"Epoch {epoch}", leave=True) if verbose else loader
-        total_loss, total_acc = 0, 0
+        # Track loss/acc per intervention type. The three types differ in difficulty
+        # (type 2 swaps both subspaces and is hardest), so an aggregate running mean is
+        # misleading: it drifts purely with the order types happen to arrive in.
+        type_loss = {0: 0.0, 1: 0.0, 2: 0.0}
+        type_acc = {0: 0.0, 1: 0.0, 2: 0.0}
+        type_cnt = {0: 0, 1: 0, 2: 0}
         for i, batch in enumerate(epoch_iter):
+            tid = int(batch["intervention_id"][0])
             batch["input_ids"] = batch["input_ids"].unsqueeze(1)
             batch["source_input_ids"] = batch["source_input_ids"].unsqueeze(2)
             for k, v in batch.items():
@@ -149,13 +156,17 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
             loss = ce_loss(outputs[0], labels)
             acc = (outputs[0].argmax(1) == labels).float().mean().item()
 
-            total_loss += loss.item()
-            total_acc += acc
+            type_loss[tid] += loss.item()
+            type_acc[tid] += acc
+            type_cnt[tid] += 1
 
             if verbose:
-                epoch_iter.set_postfix({"loss": f"{(total_loss/(i+1)):.4f}", "acc": f"{(total_acc/(i+1)):.4f}"})
+                epoch_iter.set_postfix(
+                    {f"acc{t}": f"{type_acc[t] / type_cnt[t]:.3f}" for t in (0, 1, 2) if type_cnt[t]}
+                )
             if wandb.run is not None:
-                wandb.log({"das/loss": loss.item(), "das/acc": acc, "das/step": total_steps})
+                wandb.log({"das/loss": loss.item(), "das/acc": acc,
+                           f"das/acc_type{tid}": acc, "das/step": total_steps})
 
             (loss / accumulation_steps).backward()
 
@@ -167,6 +178,19 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
                 intervenable.set_zero_grad()
                 optimizer_steps += 1
             total_steps += 1
+
+        # Periodic clean evaluation: order-independent, averaged over all types — the
+        # number to actually trust (unlike the within-epoch running means above).
+        if eval_dataset is not None and (epoch % eval_every == 0 or epoch == epochs - 1):
+            eval_acc = eval_das(intervenable, eval_dataset, embedding_dim,
+                                batch_size=eval_batch_size, verbose=False, device=device)
+            intervenable.model.train()  # eval_das switched to eval(); resume training
+            if verbose:
+                per_type = " ".join(f"acc{t}={type_acc[t] / type_cnt[t]:.3f}"
+                                    for t in (0, 1, 2) if type_cnt[t])
+                print(f"[epoch {epoch}] eval IIA={eval_acc:.4f} | train {per_type}")
+            if wandb.run is not None:
+                wandb.log({"das/eval_acc_epoch": eval_acc, "das/epoch": epoch})
 
 
 def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, verbose=True, device="cpu"):

@@ -144,7 +144,8 @@ def main(args):
         accumulation_steps = args.das_accumulation or max(1, 6400 // args.das_batch_size)
         train_das(intervenable, train_dataset, dim, batch_size=args.das_batch_size,
                   epochs=args.das_epochs, accumulation_steps=accumulation_steps,
-                  lr=args.das_lr, warmup_steps=args.das_warmup, device=device)
+                  lr=args.das_lr, warmup_steps=args.das_warmup,
+                  eval_dataset=test_dataset, eval_batch_size=args.das_batch_size, device=device)
         print("DAS counterfactual accuracy:")
         eval_das(intervenable, test_dataset, dim, batch_size=args.das_batch_size, device=device)
 
