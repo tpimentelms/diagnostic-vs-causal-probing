@@ -185,22 +185,24 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
                 optimizer_steps += 1
             total_steps += 1
 
-        # Periodic clean evaluation: order-independent, averaged over all types — the
-        # number to actually trust (unlike the within-epoch running means above).
-        if eval_dataset is not None and (epoch % eval_every == 0 or epoch == epochs - 1):
-            eval_acc = eval_das(intervenable, eval_dataset, embedding_dim,
-                                batch_size=eval_batch_size, verbose=False, device=device)
-            intervenable.model.train()  # eval_das switched to eval(); resume training
-            if verbose:
-                per_type = " ".join(f"acc{t}={type_acc[t] / type_cnt[t]:.3f}"
-                                    for t in (0, 1, 2) if type_cnt[t])
-                print(f"[epoch {epoch}] eval IIA={eval_acc:.4f} | train {per_type}")
-            if wandb.run is not None:
-                wandb.log({"das/eval_acc_epoch": eval_acc, "das/epoch": epoch})
+            # Periodic clean evaluation: order-independent, averaged over all types — the
+            # number to actually trust (unlike the within-epoch running means above).
+            if eval_dataset is not None and (epoch % eval_every == 0 or epoch == epochs - 1):
+                eval_acc, eval_pt = eval_das(intervenable, eval_dataset, embedding_dim,
+                                            batch_size=eval_batch_size, verbose=False,
+                                            device=device, return_per_type=True)
+                intervenable.model.train()  # eval_das switched to eval(); resume training
+                if verbose:
+                    pt = " ".join(f"t{t}={a:.3f}" for t, a in sorted(eval_pt.items()))
+                    print(f"[epoch {epoch}] eval IIA={eval_acc:.4f}  per-type {pt}")
+                if wandb.run is not None:
+                    wandb.log({"das/eval_acc_epoch": eval_acc, "das/epoch": epoch,
+                            **{f"das/eval_acc_type{t}": a for t, a in eval_pt.items()}})
 
 
-def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, verbose=True, device="cpu"):
-    eval_labels, eval_preds = [], []
+def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, verbose=True,
+             device="cpu", return_per_type=False):
+    eval_labels, eval_preds, eval_tids = [], [], []
     intervenable.model.eval()
 
     with torch.no_grad():
@@ -216,12 +218,18 @@ def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, verbose
             _, outputs = _run_intervenable_batch(intervenable, batch, embedding_dim)
             eval_labels.append(batch["labels"].squeeze().cpu())
             eval_preds.append(outputs[0].argmax(1).cpu())
+            eval_tids.append(batch["intervention_id"].reshape(-1).cpu())
 
-    y_true = torch.cat(eval_labels).numpy()
-    y_pred = torch.cat(eval_preds).numpy()
-    report = classification_report(y_true, y_pred, output_dict=True)
+    y_true = torch.cat(eval_labels)
+    y_pred = torch.cat(eval_preds)
+    tids = torch.cat(eval_tids)
+    acc = (y_true == y_pred).float().mean().item()
     if verbose:
-        print(classification_report(y_true, y_pred))
+        print(classification_report(y_true.numpy(), y_pred.numpy()))
     if wandb.run is not None:
-        wandb.log({"das/eval_accuracy": report["accuracy"]})
-    return report["accuracy"]
+        wandb.log({"das/eval_accuracy": acc})
+    if return_per_type:
+        per_type = {int(t): (y_pred[tids == t] == y_true[tids == t]).float().mean().item()
+                    for t in tids.unique().tolist()}
+        return acc, per_type
+    return acc
