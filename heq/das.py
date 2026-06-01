@@ -23,7 +23,7 @@ from pyvene import (
 )
 
 
-def build_das_intervenable(model, device):
+def build_das_intervenable(model, device, use_fast=False):
     config = IntervenableConfig(
         model_type=type(model),
         representations=[
@@ -32,9 +32,10 @@ def build_das_intervenable(model, device):
         ],
         intervention_types=RotatedSpaceIntervention,
     )
-    # use_fast=False: the fast path keeps only the *first* location tag, which
-    # silently drops the second source in type-2 (both-subspace) interventions.
-    intervenable = IntervenableModel(config, model, use_fast=False)
+    # use_fast=True keeps only the *first* location tag, silently dropping the second
+    # source in type-2 (both-subspace) interventions — so it is only correct for single
+    # intervention types (0 or 1). It is, however, much faster, so we allow opting in.
+    intervenable = IntervenableModel(config, model, use_fast=use_fast)
     intervenable.set_device(device)
     intervenable.disable_model_gradients()
     return intervenable
