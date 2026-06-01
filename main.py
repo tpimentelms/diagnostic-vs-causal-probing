@@ -24,6 +24,7 @@ from sklearn.metrics import classification_report
 
 from heq.data import (
     build_causal_model,
+    filter_intervention_type,
     load_or_generate_counterfactual,
     load_or_generate_factual,
     make_input_sampler,
@@ -85,6 +86,9 @@ def get_args():
     parser.add_argument("--das-accumulation", type=int, default=0,
                         help="DAS grad-accumulation steps; 0 = auto (effective batch ~6400). "
                              "Set 1 to update every minibatch (10x more updates at batch 640).")
+    parser.add_argument("--das-only-type", type=int, default=None, choices=[0, 1, 2],
+                        help="debug: train DAS on a single intervention type only "
+                             "(0=WX, 1=YZ, 2=both)")
     # Logging.
     parser.add_argument("--wandb-project", type=str, default="das-hierarchical-equality")
     parser.add_argument("--wandb-run-name", type=str, default=None)
@@ -140,6 +144,10 @@ def main(args):
 
     if "das" in steps:
         print("\n=== Distributed Alignment Search ===")
+        if args.das_only_type is not None:
+            train_dataset = filter_intervention_type(train_dataset, args.das_only_type)
+            print(f"[debug] training on intervention type {args.das_only_type} only: "
+                  f"{len(train_dataset)} examples")
         intervenable = build_das_intervenable(trained, device)
         accumulation_steps = args.das_accumulation or max(1, 6400 // args.das_batch_size)
         train_das(intervenable, train_dataset, dim, batch_size=args.das_batch_size,

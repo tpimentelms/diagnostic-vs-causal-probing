@@ -142,3 +142,10 @@ def load_or_generate_counterfactual(name, causal_model, n_examples, batch_size, 
     hf_ds = _pyvene_cf_to_hf_dataset(dataset)
     hf_ds.save_to_disk(str(path))
     return hf_ds.with_format("torch")
+
+
+def filter_intervention_type(dataset, tid):
+    """Subset a counterfactual dataset to a single intervention type (0/1/2)."""
+    ids = np.array(dataset["intervention_id"]).reshape(-1)
+    idx = np.where(ids == tid)[0]
+    return dataset.select(idx).with_format("torch")
