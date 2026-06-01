@@ -163,9 +163,13 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
             type_cnt[tid] += 1
 
             if verbose:
-                epoch_iter.set_postfix(
-                    {f"acc{t}": f"{type_acc[t] / type_cnt[t]:.3f}" for t in (0, 1, 2) if type_cnt[t]}
-                )
+                post = {f"acc{t}": f"{type_acc[t] / type_cnt[t]:.3f}" for t in (0, 1, 2) if type_cnt[t]}
+                # Also show THIS batch's raw acc, its type, and its label balance, so a
+                # drifting running average (heterogeneous blocks) is distinguishable from
+                # the model's behaviour actually changing.
+                post["raw"] = f"t{tid}={acc:.2f}"
+                post["ybal"] = f"{labels.float().mean().item():.2f}"
+                epoch_iter.set_postfix(post)
             if wandb.run is not None:
                 wandb.log({"das/loss": loss.item(), "das/acc": acc,
                            f"das/acc_type{tid}": acc, "das/step": total_steps})
