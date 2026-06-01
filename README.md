@@ -25,7 +25,7 @@ uv run python -c "import torch; print(torch.__version__, torch.version.cuda); pr
 Run the full pipeline, or any subset of steps:
 
 ```bash
-uv run python main.py                      # all steps
+CUDA_VISIBLE_DEVICES=7 uv run python main.py                      # all steps
 uv run python main.py --steps probe        # diagnostic probe only
 uv run python main.py --steps das,scaling  # DAS + the scaling sweep
 uv run python main.py --help               # all options
