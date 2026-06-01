@@ -20,7 +20,7 @@ from heq.probing import collect_activations, probe_labels
 
 # Roughly constant optimiser budget per DAS fit (with accumulation=1), so that the
 # achieved train fit reflects capacity rather than under-training.
-DAS_TARGET_UPDATES = 1000
+DAS_TARGET_UPDATES = 5000
 
 
 def run_probe_scaling(model, train_ds, test_ds, embedding_dim,
@@ -40,7 +40,7 @@ def run_probe_scaling(model, train_ds, test_ds, embedding_dim,
             true_labels = train_labels[concept][idx]
             rand_labels = np.random.permutation(true_labels)  # fixed random labelling for this n
             for key, lbls in [("correct", true_labels), ("random", rand_labels)]:
-                probe = LogisticRegression(max_iter=1000)
+                probe = LogisticRegression(C=1e6, max_iter=5000)  # ~unregularised: measure true capacity
                 probe.fit(acts, lbls)
                 # train fit on the labels it was fit to == spurious capacity (for `random`)
                 results[concept][key]["train"].append(probe.score(acts, lbls))
