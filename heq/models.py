@@ -23,7 +23,7 @@ def compute_metrics(eval_pred):
     }
 
 
-def train_mlp(train_ds, test_ds, embedding_dim, batch_size=1024, epochs=3):
+def train_mlp(train_ds, test_ds, embedding_dim, batch_size=1024, epochs=3, weight_decay=0.01):
     _, _, model = create_mlp_classifier(mlp_config(embedding_dim))
 
     print("Configuring training")
@@ -31,6 +31,7 @@ def train_mlp(train_ds, test_ds, embedding_dim, batch_size=1024, epochs=3):
         output_dir="test_trainer",
         eval_strategy="epoch",
         learning_rate=0.001,
+        weight_decay=weight_decay,
         num_train_epochs=epochs,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
@@ -52,8 +53,11 @@ def train_mlp(train_ds, test_ds, embedding_dim, batch_size=1024, epochs=3):
     return model, trainer
 
 
-def load_or_train_mlp(train_ds, test_ds, embedding_dim, n_examples, epochs=5, device="cpu", **cache_params):
-    mlp_params = {**cache_params, "epochs": epochs}
+def load_or_train_mlp(train_ds, test_ds, embedding_dim, n_examples, epochs=5, weight_decay=0.01, device="cpu", **cache_params):
+    # weight_decay is part of the cache key: it changes the trained weights (and
+    # crucially their confidence/logit scale), so it must not reuse a checkpoint
+    # trained with a different value.
+    mlp_params = {**cache_params, "epochs": epochs, "wd": weight_decay}
     path = Path(str(cache_path("mlp", n_examples, **mlp_params)) + ".pt")
     if path.exists():
         print(f"Loading cached MLP from {path}")
@@ -62,7 +66,7 @@ def load_or_train_mlp(train_ds, test_ds, embedding_dim, n_examples, epochs=5, de
         model.load_state_dict(torch.load(str(path), map_location=device, weights_only=True))
         return model
     CACHE_DIR.mkdir(exist_ok=True)
-    trained, _ = train_mlp(train_ds, test_ds, embedding_dim, epochs=epochs)
+    trained, _ = train_mlp(train_ds, test_ds, embedding_dim, epochs=epochs, weight_decay=weight_decay)
     # HF Trainer trains on its own auto-selected device; pin the result to the
     # device the rest of the pipeline (probing, DAS) expects before returning.
     trained.to(device)
