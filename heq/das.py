@@ -1,0 +1,184 @@
+"""Distributed Alignment Search (DAS) with a linear (rotation) alignment map.
+
+We learn an orthogonal map onto the MLP's hidden space, intervene on the WX and
+YZ subspaces in that rotated basis, and measure the interchange-intervention
+accuracy with which the (frozen) MLP reproduces the target algorithm's
+counterfactual outputs.
+"""
+
+import random
+
+import torch
+import wandb
+from sklearn.metrics import classification_report
+from torch.utils.data import DataLoader
+from tqdm import tqdm, trange
+
+from pyvene import (
+    IntervenableConfig,
+    IntervenableModel,
+    RepresentationConfig,
+    RotatedSpaceIntervention,
+)
+
+
+def build_das_intervenable(model, device):
+    config = IntervenableConfig(
+        model_type=type(model),
+        representations=[
+            RepresentationConfig(0, "block_output", "pos", 1, subspace_partition=None, intervention_link_key=0),
+            RepresentationConfig(0, "block_output", "pos", 1, subspace_partition=None, intervention_link_key=0),
+        ],
+        intervention_types=RotatedSpaceIntervention,
+    )
+    intervenable = IntervenableModel(config, model, use_fast=True)
+    intervenable.set_device(device)
+    intervenable.disable_model_gradients()
+    return intervenable
+
+
+def get_batched_sampler(batch_size):
+    """Shuffle batch order without mixing examples across batch boundaries.
+
+    pyvene stores counterfactual examples in contiguous blocks of ``batch_size``,
+    each block sharing the same ``intervention_id``. Shuffling individual examples
+    would mix intervention types within a DataLoader batch; we shuffle block order
+    instead so each epoch sees a different interleaving of the types.
+    """
+    def batched_random_sampler(data):
+        batch_indices = list(range(len(data) // batch_size))
+        random.shuffle(batch_indices)
+        for b_i in batch_indices:
+            for i in range(b_i * batch_size, (b_i + 1) * batch_size):
+                yield i
+    return batched_random_sampler
+
+
+def reset_das_rotation(intervenable, n):
+    """Re-initialise the shared rotation to a random orthogonal matrix."""
+    for v in intervenable.interventions.values():
+        with torch.no_grad():
+            new_base = torch.empty(n, n)
+            torch.nn.init.orthogonal_(new_base)
+            v.rotate_layer.parametrizations.weight[0].base.copy_(new_base)
+            v.rotate_layer.parametrizations.weight.original.data.copy_(-torch.eye(n))
+        break
+
+
+def _run_intervenable_batch(intervenable, batch, embedding_dim):
+    assert batch["intervention_id"].unique().numel() == 1, \
+        "All examples in a batch must share the same intervention_id"
+    batch_size = batch["input_ids"].shape[0]
+    wx_subspace = [[_ for _ in range(0, embedding_dim * 2)]] * batch_size
+    yz_subspace = [[_ for _ in range(embedding_dim * 2, embedding_dim * 4)]] * batch_size
+    pos = [[[[0]] * batch_size] for _ in range(4)]
+
+    if batch["intervention_id"][0] == 2:
+        return intervenable(
+            {"inputs_embeds": batch["input_ids"]},
+            [{"inputs_embeds": batch["source_input_ids"][:, 0]},
+             {"inputs_embeds": batch["source_input_ids"][:, 1]}],
+            {"sources->base": (pos[0] + pos[1], pos[2] + pos[3])},
+            subspaces=[wx_subspace, yz_subspace],
+        )
+    elif batch["intervention_id"][0] == 0:
+        return intervenable(
+            {"inputs_embeds": batch["input_ids"]},
+            [{"inputs_embeds": batch["source_input_ids"][:, 0]}, None],
+            {"sources->base": (pos[0] + [None], pos[1] + [None])},
+            subspaces=[wx_subspace, None],
+        )
+    elif batch["intervention_id"][0] == 1:
+        return intervenable(
+            {"inputs_embeds": batch["input_ids"]},
+            [None, {"inputs_embeds": batch["source_input_ids"][:, 0]}],
+            {"sources->base": ([None] + pos[0], [None] + pos[1])},
+            subspaces=[None, yz_subspace],
+        )
+
+
+def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
+              accumulation_steps=1, lr=0.001, warmup_steps=100,
+              randomize_labels=False, verbose=True, device="cpu"):
+    optimizer_params = []
+    for k, v in intervenable.interventions.items():
+        optimizer_params += [{"params": v.rotate_layer.parameters()}]
+        break
+    optimizer = torch.optim.Adam(optimizer_params, lr=lr)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: min(1.0, (step + 1) / max(1, warmup_steps)),
+    )
+    ce_loss = torch.nn.CrossEntropyLoss()
+
+    intervenable.model.train()
+    if verbose:
+        print("Trainable intervention parameters:", intervenable.count_parameters())
+        print(f"Effective batch size: {batch_size * accumulation_steps}")
+
+    total_steps = 1
+    optimizer_steps = 0
+    epoch_iter_outer = trange(epochs, desc="Epoch") if verbose else range(epochs)
+    for epoch in epoch_iter_outer:
+        sampler = get_batched_sampler(batch_size)
+        loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler(dataset))
+        epoch_iter = tqdm(loader, desc=f"Epoch {epoch}", leave=True) if verbose else loader
+        total_loss, total_acc = 0, 0
+        for i, batch in enumerate(epoch_iter):
+            batch["input_ids"] = batch["input_ids"].unsqueeze(1)
+            batch["source_input_ids"] = batch["source_input_ids"].unsqueeze(2)
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device)
+
+            _, outputs = _run_intervenable_batch(intervenable, batch, embedding_dim)
+            labels = batch["labels"].squeeze().to(torch.long)
+            if randomize_labels:
+                labels = labels[torch.randperm(len(labels))]
+            loss = ce_loss(outputs[0], labels)
+            acc = (outputs[0].argmax(1) == labels).float().mean().item()
+
+            total_loss += loss.item()
+            total_acc += acc
+
+            if verbose:
+                epoch_iter.set_postfix({"loss": f"{(total_loss/(i+1)):.4f}", "acc": f"{(total_acc/(i+1)):.4f}"})
+            if wandb.run is not None:
+                wandb.log({"das/loss": loss.item(), "das/acc": acc, "das/step": total_steps})
+
+            (loss / accumulation_steps).backward()
+
+            if total_steps % accumulation_steps == 0:
+                optimizer.step()
+                scheduler.step()
+                intervenable.set_zero_grad()
+                optimizer_steps += 1
+            total_steps += 1
+
+
+def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, verbose=True, device="cpu"):
+    eval_labels, eval_preds = [], []
+    intervenable.model.eval()
+
+    with torch.no_grad():
+        loader = DataLoader(test_dataset, batch_size=batch_size)
+        loader = tqdm(loader, desc="Eval") if verbose else loader
+        for batch in loader:
+            batch["input_ids"] = batch["input_ids"].unsqueeze(1)
+            batch["source_input_ids"] = batch["source_input_ids"].unsqueeze(2)
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device)
+
+            _, outputs = _run_intervenable_batch(intervenable, batch, embedding_dim)
+            eval_labels.append(batch["labels"].squeeze().cpu())
+            eval_preds.append(outputs[0].argmax(1).cpu())
+
+    y_true = torch.cat(eval_labels).numpy()
+    y_pred = torch.cat(eval_preds).numpy()
+    report = classification_report(y_true, y_pred, output_dict=True)
+    if verbose:
+        print(classification_report(y_true, y_pred))
+    if wandb.run is not None:
+        wandb.log({"das/eval_accuracy": report["accuracy"]})
+    return report["accuracy"]
