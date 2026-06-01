@@ -24,6 +24,7 @@ from sklearn.metrics import classification_report
 
 from heq.data import (
     build_causal_model,
+    filter_intervention_type,
     load_or_generate_counterfactual,
     load_or_generate_factual,
     make_input_sampler,
@@ -82,6 +83,12 @@ def get_args():
     parser.add_argument("--das-epochs", type=int, default=20)
     parser.add_argument("--das-lr", type=float, default=0.001)
     parser.add_argument("--das-warmup", type=int, default=100, help="DAS warmup in optimizer steps")
+    parser.add_argument("--das-accumulation", type=int, default=0,
+                        help="DAS grad-accumulation steps; 0 = auto (effective batch ~6400). "
+                             "Set 1 to update every minibatch (10x more updates at batch 640).")
+    parser.add_argument("--das-only-type", type=int, default=None, choices=[0, 1, 2],
+                        help="debug: train DAS on a single intervention type only "
+                             "(0=WX, 1=YZ, 2=both)")
     # Logging.
     parser.add_argument("--wandb-project", type=str, default="das-hierarchical-equality")
     parser.add_argument("--wandb-run-name", type=str, default=None)
@@ -137,11 +144,19 @@ def main(args):
 
     if "das" in steps:
         print("\n=== Distributed Alignment Search ===")
-        intervenable = build_das_intervenable(trained, device)
-        accumulation_steps = 6400 // args.das_batch_size
+        if args.das_only_type is not None:
+            train_dataset = filter_intervention_type(train_dataset, args.das_only_type)
+            print(f"[debug] training on intervention type {args.das_only_type} only: "
+                  f"{len(train_dataset)} examples")
+        # use_fast is correct only for single-location interventions (types 0/1); type 2
+        # needs the slow path. Enable the fast path when debugging a single type 0/1.
+        das_use_fast = args.das_only_type in (0, 1)
+        intervenable = build_das_intervenable(trained, device, use_fast=das_use_fast)
+        accumulation_steps = args.das_accumulation or max(1, 6400 // args.das_batch_size)
         train_das(intervenable, train_dataset, dim, batch_size=args.das_batch_size,
                   epochs=args.das_epochs, accumulation_steps=accumulation_steps,
-                  lr=args.das_lr, warmup_steps=args.das_warmup, device=device)
+                  lr=args.das_lr, warmup_steps=args.das_warmup,
+                  eval_dataset=test_dataset, eval_batch_size=args.das_batch_size, device=device)
         print("DAS counterfactual accuracy:")
         eval_das(intervenable, test_dataset, dim, batch_size=args.das_batch_size, device=device)
 

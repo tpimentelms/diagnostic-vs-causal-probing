@@ -6,6 +6,7 @@ accuracy with which the (frozen) MLP reproduces the target algorithm's
 counterfactual outputs.
 """
 
+import math
 import random
 
 import torch
@@ -22,7 +23,7 @@ from pyvene import (
 )
 
 
-def build_das_intervenable(model, device):
+def build_das_intervenable(model, device, use_fast=False):
     config = IntervenableConfig(
         model_type=type(model),
         representations=[
@@ -31,7 +32,10 @@ def build_das_intervenable(model, device):
         ],
         intervention_types=RotatedSpaceIntervention,
     )
-    intervenable = IntervenableModel(config, model, use_fast=True)
+    # use_fast=True keeps only the *first* location tag, silently dropping the second
+    # source in type-2 (both-subspace) interventions — so it is only correct for single
+    # intervention types (0 or 1). It is, however, much faster, so we allow opting in.
+    intervenable = IntervenableModel(config, model, use_fast=use_fast)
     intervenable.set_device(device)
     intervenable.disable_model_gradients()
     return intervenable
@@ -98,17 +102,30 @@ def _run_intervenable_batch(intervenable, batch, embedding_dim):
 
 
 def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
-              accumulation_steps=1, lr=0.001, warmup_steps=100,
-              randomize_labels=False, verbose=True, device="cpu"):
-    optimizer_params = []
+              accumulation_steps=1, lr=0.001, warmup_steps=100, grad_clip=1.0,
+              randomize_labels=False, eval_dataset=None, eval_batch_size=640,
+              eval_every=1, verbose=True, device="cpu"):
+    rotation_params = []
     for k, v in intervenable.interventions.items():
-        optimizer_params += [{"params": v.rotate_layer.parameters()}]
+        rotation_params = list(v.rotate_layer.parameters())
         break
-    optimizer = torch.optim.Adam(optimizer_params, lr=lr)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: min(1.0, (step + 1) / max(1, warmup_steps)),
-    )
+    optimizer = torch.optim.Adam(rotation_params, lr=lr)
+    # Snapshot the rotation at init so we can verify it is actually being updated.
+    rot_init = [p.detach().clone() for p in rotation_params]
+
+    # Warmup then cosine decay. Holding lr flat after warmup made the rotation
+    # overshoot once it reached a good (and, with a confident MLP, sharp) alignment,
+    # sending the loss back up; decaying to ~0 lets it settle into the solution.
+    minibatches_per_epoch = max(1, len(dataset) // batch_size)
+    total_optim_steps = max(1, (epochs * minibatches_per_epoch) // accumulation_steps)
+
+    def lr_schedule(step):
+        if step < warmup_steps:
+            return (step + 1) / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_optim_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_schedule)
     ce_loss = torch.nn.CrossEntropyLoss()
 
     intervenable.model.train()
@@ -118,13 +135,20 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
 
     total_steps = 1
     optimizer_steps = 0
+    grad_norm = float("nan")
     epoch_iter_outer = trange(epochs, desc="Epoch") if verbose else range(epochs)
     for epoch in epoch_iter_outer:
         sampler = get_batched_sampler(batch_size)
         loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler(dataset))
         epoch_iter = tqdm(loader, desc=f"Epoch {epoch}", leave=True) if verbose else loader
-        total_loss, total_acc = 0, 0
+        # Track loss/acc per intervention type. The three types differ in difficulty
+        # (type 2 swaps both subspaces and is hardest), so an aggregate running mean is
+        # misleading: it drifts purely with the order types happen to arrive in.
+        type_loss = {0: 0.0, 1: 0.0, 2: 0.0}
+        type_acc = {0: 0.0, 1: 0.0, 2: 0.0}
+        type_cnt = {0: 0, 1: 0, 2: 0}
         for i, batch in enumerate(epoch_iter):
+            tid = int(batch["intervention_id"][0])
             batch["input_ids"] = batch["input_ids"].unsqueeze(1)
             batch["source_input_ids"] = batch["source_input_ids"].unsqueeze(2)
             for k, v in batch.items():
@@ -138,26 +162,55 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
             loss = ce_loss(outputs[0], labels)
             acc = (outputs[0].argmax(1) == labels).float().mean().item()
 
-            total_loss += loss.item()
-            total_acc += acc
+            type_loss[tid] += loss.item()
+            type_acc[tid] += acc
+            type_cnt[tid] += 1
 
             if verbose:
-                epoch_iter.set_postfix({"loss": f"{(total_loss/(i+1)):.4f}", "acc": f"{(total_acc/(i+1)):.4f}"})
+                post = {f"acc{t}": f"{type_acc[t] / type_cnt[t]:.3f}" for t in (0, 1, 2) if type_cnt[t]}
+                # Also show THIS batch's raw acc, its type, and its label balance, so a
+                # drifting running average (heterogeneous blocks) is distinguishable from
+                # the model's behaviour actually changing.
+                post["raw"] = f"t{tid}={acc:.2f}"
+                post["ybal"] = f"{labels.float().mean().item():.2f}"
+                epoch_iter.set_postfix(post)
             if wandb.run is not None:
-                wandb.log({"das/loss": loss.item(), "das/acc": acc, "das/step": total_steps})
+                wandb.log({"das/loss": loss.item(), "das/acc": acc,
+                           f"das/acc_type{tid}": acc, "das/step": total_steps})
 
             (loss / accumulation_steps).backward()
 
             if total_steps % accumulation_steps == 0:
+                # clip_grad_norm_ returns the pre-clip total norm — use it as a probe of
+                # whether any gradient is actually reaching the rotation.
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    rotation_params, grad_clip if grad_clip else float("inf")).item()
                 optimizer.step()
                 scheduler.step()
                 intervenable.set_zero_grad()
                 optimizer_steps += 1
             total_steps += 1
 
+        # Periodic clean evaluation: order-independent, averaged over all types — the
+        # number to actually trust (unlike the within-epoch running means above).
+        if eval_dataset is not None and (epoch % eval_every == 0 or epoch == epochs - 1):
+            eval_acc, eval_pt = eval_das(intervenable, eval_dataset, embedding_dim,
+                                        batch_size=eval_batch_size, verbose=False,
+                                        device=device, return_per_type=True)
+            intervenable.model.train()  # eval_das switched to eval(); resume training
+            if verbose:
+                pt = " ".join(f"t{t}={a:.3f}" for t, a in sorted(eval_pt.items()))
+                rot_delta = sum((p - p0).norm().item() for p, p0 in zip(rotation_params, rot_init))
+                print(f"[epoch {epoch}] eval IIA={eval_acc:.4f}  per-type {pt}  "
+                        f"|grad|={grad_norm:.2e}  Δrot={rot_delta:.2e}")
+            if wandb.run is not None:
+                wandb.log({"das/eval_acc_epoch": eval_acc, "das/epoch": epoch,
+                        **{f"das/eval_acc_type{t}": a for t, a in eval_pt.items()}})
 
-def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, verbose=True, device="cpu"):
-    eval_labels, eval_preds = [], []
+
+def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, verbose=True,
+             device="cpu", return_per_type=False):
+    eval_labels, eval_preds, eval_tids = [], [], []
     intervenable.model.eval()
 
     with torch.no_grad():
@@ -173,12 +226,18 @@ def eval_das(intervenable, test_dataset, embedding_dim, batch_size=6400, verbose
             _, outputs = _run_intervenable_batch(intervenable, batch, embedding_dim)
             eval_labels.append(batch["labels"].squeeze().cpu())
             eval_preds.append(outputs[0].argmax(1).cpu())
+            eval_tids.append(batch["intervention_id"].reshape(-1).cpu())
 
-    y_true = torch.cat(eval_labels).numpy()
-    y_pred = torch.cat(eval_preds).numpy()
-    report = classification_report(y_true, y_pred, output_dict=True)
+    y_true = torch.cat(eval_labels)
+    y_pred = torch.cat(eval_preds)
+    tids = torch.cat(eval_tids)
+    acc = (y_true == y_pred).float().mean().item()
     if verbose:
-        print(classification_report(y_true, y_pred))
+        print(classification_report(y_true.numpy(), y_pred.numpy()))
     if wandb.run is not None:
-        wandb.log({"das/eval_accuracy": report["accuracy"]})
-    return report["accuracy"]
+        wandb.log({"das/eval_accuracy": acc})
+    if return_per_type:
+        per_type = {int(t): (y_pred[tids == t] == y_true[tids == t]).float().mean().item()
+                    for t in tids.unique().tolist()}
+        return acc, per_type
+    return acc
