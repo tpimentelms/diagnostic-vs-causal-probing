@@ -6,6 +6,7 @@ accuracy with which the (frozen) MLP reproduces the target algorithm's
 counterfactual outputs.
 """
 
+import math
 import random
 
 import torch
@@ -98,17 +99,27 @@ def _run_intervenable_batch(intervenable, batch, embedding_dim):
 
 
 def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
-              accumulation_steps=1, lr=0.001, warmup_steps=100,
+              accumulation_steps=1, lr=0.001, warmup_steps=100, grad_clip=1.0,
               randomize_labels=False, verbose=True, device="cpu"):
-    optimizer_params = []
+    rotation_params = []
     for k, v in intervenable.interventions.items():
-        optimizer_params += [{"params": v.rotate_layer.parameters()}]
+        rotation_params = list(v.rotate_layer.parameters())
         break
-    optimizer = torch.optim.Adam(optimizer_params, lr=lr)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: min(1.0, (step + 1) / max(1, warmup_steps)),
-    )
+    optimizer = torch.optim.Adam(rotation_params, lr=lr)
+
+    # Warmup then cosine decay. Holding lr flat after warmup made the rotation
+    # overshoot once it reached a good (and, with a confident MLP, sharp) alignment,
+    # sending the loss back up; decaying to ~0 lets it settle into the solution.
+    minibatches_per_epoch = max(1, len(dataset) // batch_size)
+    total_optim_steps = max(1, (epochs * minibatches_per_epoch) // accumulation_steps)
+
+    def lr_schedule(step):
+        if step < warmup_steps:
+            return (step + 1) / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_optim_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_schedule)
     ce_loss = torch.nn.CrossEntropyLoss()
 
     intervenable.model.train()
@@ -149,6 +160,8 @@ def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,
             (loss / accumulation_steps).backward()
 
             if total_steps % accumulation_steps == 0:
+                if grad_clip:
+                    torch.nn.utils.clip_grad_norm_(rotation_params, grad_clip)
                 optimizer.step()
                 scheduler.step()
                 intervenable.set_zero_grad()
