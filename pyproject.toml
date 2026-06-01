@@ -1,0 +1,35 @@
+[project]
+name = "hierarchical-equality-probing"
+version = "0.1.0"
+description = "Diagnostic probing vs. distributed alignment search on the hierarchical equality task."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "torch>=2.7",
+    "transformers",
+    "datasets",
+    "scikit-learn",
+    "numpy",
+    "tqdm",
+    "matplotlib",
+    "wandb",
+    "pyvene",
+]
+
+# This is an application (run as `python main.py`), not an installable library,
+# so uv manages the environment without trying to build/install the project.
+[tool.uv]
+package = false
+
+# PyTorch ships separate wheels per accelerator. On Linux we pull the CUDA 12.8
+# build (required for Blackwell / sm_120); on macOS the default PyPI wheel
+# already includes MPS, so no override is needed there.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
