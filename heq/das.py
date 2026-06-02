@@ -1,9 +1,9 @@
 """Distributed Alignment Search (DAS) with a linear (rotation) alignment map.
 
-We learn an orthogonal map onto the MLP's hidden space, intervene on the WX and
-YZ subspaces in that rotated basis, and measure the interchange-intervention
-accuracy with which the (frozen) MLP reproduces the target algorithm's
-counterfactual outputs.
+We learn an orthogonal map onto the MLP's hidden space, intervene on the WX
+subspace in that rotated basis, and measure the interchange-intervention accuracy
+with which the (frozen) MLP reproduces the target algorithm's counterfactual
+outputs.
 """
 
 import math
@@ -23,7 +23,7 @@ from pyvene import (
 )
 
 
-def build_das_intervenable(model, device, use_fast=False):
+def build_das_intervenable(model, device, use_fast=True):
     config = IntervenableConfig(
         model_type=type(model),
         representations=[
@@ -32,9 +32,9 @@ def build_das_intervenable(model, device, use_fast=False):
         ],
         intervention_types=RotatedSpaceIntervention,
     )
-    # use_fast=True keeps only the *first* location tag, silently dropping the second
-    # source in type-2 (both-subspace) interventions — so it is only correct for single
-    # intervention types (0 or 1). It is, however, much faster, so we allow opting in.
+    # We only run single-source (WX) interventions, so the fast path is correct and
+    # much faster. (use_fast keeps only the first source location, which is exactly
+    # what broke the two-source joint intervention we have since dropped.)
     intervenable = IntervenableModel(config, model, use_fast=use_fast)
     intervenable.set_device(device)
     intervenable.disable_model_gradients()
@@ -70,35 +70,18 @@ def reset_das_rotation(intervenable, n):
 
 
 def _run_intervenable_batch(intervenable, batch, embedding_dim):
-    assert batch["intervention_id"].unique().numel() == 1, \
-        "All examples in a batch must share the same intervention_id"
+    # WX-only: swap the WX subspace from the single source, leaving the rest of the
+    # hidden state (which carries YZ) untouched.
     batch_size = batch["input_ids"].shape[0]
     wx_subspace = [[_ for _ in range(0, embedding_dim * 2)]] * batch_size
-    yz_subspace = [[_ for _ in range(embedding_dim * 2, embedding_dim * 4)]] * batch_size
-    pos = [[[[0]] * batch_size] for _ in range(4)]
+    pos = [[[[0]] * batch_size] for _ in range(2)]
 
-    if batch["intervention_id"][0] == 2:
-        return intervenable(
-            {"inputs_embeds": batch["input_ids"]},
-            [{"inputs_embeds": batch["source_input_ids"][:, 0]},
-             {"inputs_embeds": batch["source_input_ids"][:, 1]}],
-            {"sources->base": (pos[0] + pos[1], pos[2] + pos[3])},
-            subspaces=[wx_subspace, yz_subspace],
-        )
-    elif batch["intervention_id"][0] == 0:
-        return intervenable(
-            {"inputs_embeds": batch["input_ids"]},
-            [{"inputs_embeds": batch["source_input_ids"][:, 0]}, None],
-            {"sources->base": (pos[0] + [None], pos[1] + [None])},
-            subspaces=[wx_subspace, None],
-        )
-    elif batch["intervention_id"][0] == 1:
-        return intervenable(
-            {"inputs_embeds": batch["input_ids"]},
-            [None, {"inputs_embeds": batch["source_input_ids"][:, 0]}],
-            {"sources->base": ([None] + pos[0], [None] + pos[1])},
-            subspaces=[None, yz_subspace],
-        )
+    return intervenable(
+        {"inputs_embeds": batch["input_ids"]},
+        [{"inputs_embeds": batch["source_input_ids"][:, 0]}, None],
+        {"sources->base": (pos[0] + [None], pos[1] + [None])},
+        subspaces=[wx_subspace, None],
+    )
 
 
 def train_das(intervenable, dataset, embedding_dim, batch_size=6400, epochs=10,

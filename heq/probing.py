@@ -1,5 +1,5 @@
 """Diagnostic probing: train linear probes on the MLP's hidden activations to
-decode the ground-truth concepts (WX, YZ) and the output (O).
+decode the ground-truth concept WX and the output O.
 """
 
 import numpy as np
@@ -30,9 +30,8 @@ def probe_labels(ds, embedding_dim):
     inputs = np.array(ds["inputs_embeds"])
     d = embedding_dim
     WX = (np.abs(inputs[:, :d] - inputs[:, d:2*d]).sum(1) < 1e-6).astype(int)
-    YZ = (np.abs(inputs[:, 2*d:3*d] - inputs[:, 3*d:]).sum(1) < 1e-6).astype(int)
     O = np.array(ds["labels"]).argmax(1)
-    return {"WX": WX, "YZ": YZ, "O": O}
+    return {"WX": WX, "O": O}
 
 
 def run_probe_experiment(model, train_ds, test_ds, embedding_dim, n_layers=3, batch_size=1024, device="cpu"):
@@ -43,7 +42,7 @@ def run_probe_experiment(model, train_ds, test_ds, embedding_dim, n_layers=3, ba
     for layer_idx in range(n_layers):
         train_acts = collect_activations(model, train_ds, layer_idx, batch_size, device)
         test_acts = collect_activations(model, test_ds, layer_idx, batch_size, device)
-        for concept in ["WX", "YZ", "O"]:
+        for concept in ["WX", "O"]:
             probe = LogisticRegression(max_iter=1000)
             probe.fit(train_acts, train_labels[concept])
             acc = probe.score(test_acts, test_labels[concept])

@@ -40,29 +40,27 @@ Toward a Unified Capacity Measure for Diagnostic\\ and Causal Interpretability}}
 
 \begin{abstract}
 \noindent
-Two recent results paint an uncomfortable picture of how we interpret neural
-networks. On the diagnostic side, \citet{pimentel2020information} show that, under
-an information-theoretic operationalisation, a sufficiently powerful probe will
-\emph{always} recover a target property---making the success of probing
-uninformative about the representation itself. On the causal side,
-\citet{sutter2025nonlinear} show that, with a sufficiently complex alignment map,
-\emph{any} algorithm can be cast as a distributed abstraction of \emph{any}
-network---making causal abstraction vacuous without constraints. Both results are
-\emph{population-level} statements about a limit of infinite probe capacity. In
-practice, however, we never operate in that limit: we fit a probe or an alignment
-map on a finite sample, and the danger is the \emph{finite-sample optimism} that
-this fitting introduces---a propensity to find structure that is not there. In
-this technical report we argue that this propensity is, for both techniques, an
-instance of the same object: the \textbf{Rademacher complexity} of the
-interpretability method's hypothesis class, evaluated on the representations. We
-make this unification precise, separate it cleanly from the population-level
-vacuity that the two theorems describe, and propose a concrete experimental
-protocol---building directly on an existing implementation of the hierarchical
-equality task---to measure how this \emph{spurious-fitting capacity} scales with
-probe complexity for diagnostic probing and for distributed alignment search
-(DAS). Our central question is not \emph{whether} both methods fail in the limit
-(they do), but \emph{how gracefully} each approaches that limit, and which
-structural constraints govern the rate.
+Diagnostic probing and causal probing (via distributed alignment search, DAS) both
+tend to find what one looks for if the probe is powerful enough.
+\citet{pimentel2020information} show that a sufficiently powerful diagnostic probe
+always recovers a target property, and \citet{sutter2025nonlinear} show that a
+sufficiently complex alignment map makes any algorithm a distributed abstraction of
+any network. Both are statements about a limit: at infinite complexity, either method
+can fit any target, including a random one, so its reported score says nothing about
+the network. Read at face value, the causal result says that causal probing is no
+better than diagnostic probing---it leaves us where diagnostic probing did. But that
+is a claim about the limit. We do not work at that limit: at finite complexity and
+finite data, neither method can fit everything, and the extra structure in a causal
+probe might make it more resistant to fitting \emph{spurious} targets, so causality
+could help in practice even if both methods fail in the limit. This report proposes
+measuring that directly---how well a method fits randomly relabelled data, which is a
+version of its empirical Rademacher complexity---in a form that applies unchanged to
+diagnostic probing and to DAS, and asks how this spurious-fitting capacity grows with
+complexity for each. We describe
+the measure and an experimental protocol on the hierarchical equality task, and
+report preliminary results: a linear probe recovers the task's intermediate variables
+almost perfectly, while a linear DAS map does not recover them causally on the same
+model. We discuss why, and what is needed to turn this into a clean comparison.
 \end{abstract}
 
 \section{Motivation}\label{sec:motivation}
@@ -93,16 +91,27 @@ solve the task. They call this the \textbf{non-linear representation dilemma}:
 lifting the linearity constraint removes any principled way to trade off the
 alignment map's complexity against its accuracy.
 
-Read together, the two results describe \emph{the same failure with two faces}.
-In both, an interpretability method reports a score---probe accuracy, or
-IIA---that is optimised over a family of extraction functions, and in both, that
-score becomes uninformative once the family is expressive enough. The practitioner
-is left without a principled way to choose the family's complexity. This report
-asks whether the two methods are not just analogous but \emph{measurable on a
-common axis}: can we define a single notion of capacity, in the spirit of
+Read together, the two results are one failure seen twice: in each, an
+interpretability method reports a score---probe accuracy, or IIA---chosen as the best
+fit over a family of extraction functions, and in each, that score stops being
+informative once the family is expressive enough. The practitioner has no principled
+way to set the family's complexity.
+
+There is a pessimistic reading of this, and it is worth stating plainly.
+\citet{sutter2025nonlinear} show that in the limit of unconstrained alignment maps,
+causal abstraction is vacuous in the same way diagnostic probing is: the method
+succeeds regardless of what the network computes. At face value, this says that moving
+from diagnostic to causal probing buys us nothing---we are left where
+\citet{pimentel2020information} left us. But it is a claim about the limit, and it need
+not hold in practice. At the finite map complexities people actually use, the extra
+structure in a causal probe---it must act through the frozen network, and stay
+consistent across several interventions---might make it harder to fit spurious
+patterns than a diagnostic probe of comparable power. If so, causality does add
+something: not in the limit, but in the regime we work in. Whether it does is an
+empirical question. To answer it we need a measure of how readily each method fits
+spurious targets that applies to both---a single notion of capacity, in the spirit of
 Rademacher complexity \citep{bartlett2002rademacher} or VC dimension
-\citep{vapnik1998statistical}, that quantifies each method's propensity to find
-spurious structure, and study how that propensity grows?
+\citep{vapnik1998statistical}---and a way to watch it grow with complexity.
 
 \section{Setup and notation}\label{sec:setup}
 
@@ -150,12 +159,12 @@ and the family is constrained to invertible $\phi$.
 
 \subsection{Spuriousness as fit to randomised targets}
 
-The propensity to ``find what you want'' is, statistically, the gap between the
-fit a method reports and the fit it \emph{deserves}: the optimism of an
-empirical-risk maximiser. Uniform-convergence theory names the leading term of this
-optimism the \emph{Rademacher complexity} of the hypothesis class
-\citep{bartlett2002rademacher}. We take this as our definition of spurious-fitting
-capacity, expressed directly in the accuracy space the two methods report.
+We want to measure how much of a method's reported fit could be spurious---how well
+it fits targets that carry no real signal about the network. The direct way to do
+this is to relabel the data at random and check how well the method still fits it.
+The expected best fit a hypothesis class achieves on such random targets is, up to
+scaling, its empirical \emph{Rademacher complexity} \citep{bartlett2002rademacher};
+we use it, in accuracy space, as our measure of spurious-fitting capacity.
 
 \begin{definition}[Spurious-fitting capacity]\label{def:capacity}
 Fix a representation sample of size $n$ and let $\bm\sigma$ denote a target
@@ -190,30 +199,21 @@ existing code paths, which already train on randomised labels.} Third, it is
 \emph{cheap}: a Monte-Carlo estimate requires only re-running the existing fitting
 pipeline on permuted targets.
 
-\subsection{Two failure modes, kept separate}\label{sec:two-modes}
+\subsection{The limit and the finite regime}\label{sec:two-modes}
 
-It is essential not to conflate \autoref{def:capacity} with the failure the two
-theorems describe. They live at different scales.
+\autoref{def:capacity} is not what the two theorems are about, and the difference
+matters. The theorems are about a limit: at infinite complexity, both a probe and an
+alignment map can fit any target on any amount of data, random targets included
+\citep[Thm.~1]{pimentel2020information,sutter2025nonlinear}. In that limit the two
+methods are equally uninformative and nothing tells them apart.
 
-\begin{description}[leftmargin=1.4em]
-  \item[(a) Population vacuity.] As $\complexity \to \infty$, the
-  \emph{population} estimand becomes uninformative: an arbitrarily powerful probe
-  saturates the mutual-information bound \citep[Thm.~1]{pimentel2020information},
-  and an arbitrarily complex alignment map achieves perfect IIA on any network
-  \citep[Thm.~1]{sutter2025nonlinear}. In this limit \emph{both methods are equally
-  doomed}; the limit itself does not distinguish them.
-  \item[(b) Finite-sample optimism.] At finite $n$, the reported score exceeds the
-  population value by an amount controlled by $\rade_n(\hypclass_{\complexity})$.
-  This term \emph{does} distinguish the methods, and it is the only thing that can.
-\end{description}
-
-We therefore argue that the scientifically productive question is not the
-$\complexity\to\infty$ limit---which the theorems have settled---but the
-\emph{rate} at which $\rade_n(\hypclass_{\complexity})$ grows as we approach it.
-``Failing gracefully'' is a statement about this rate. This separation also
-disarms an obvious objection (``your own theorems say the limit is degenerate, so
-why measure capacity?''): we are not studying the limit, we are studying the
-finite-sample road to it.
+We never run at that limit. We fit at finite complexity on finite data, where neither
+method can fit everything. There, the two can differ: a linear probe and a linear
+rotation do not have the same ability to fit random relabellings, and that ability
+grows differently as we make each more complex. \autoref{def:capacity} measures
+exactly this ability, and its growth with complexity is what we study---not whether
+the methods break in the limit (they do), but how their capacity to fit spurious
+targets grows on the way there.
 
 \subsection{What ``graceful'' should mean, and the comparability problem}
 
@@ -320,6 +320,63 @@ signal--spurious plane), then capacity carries no method-distinguishing
 information and the unification, while tidy, would be practically empty. We regard
 making this falsifiable as a feature.
 
+\section{Preliminary results}\label{sec:results}
+
+We report initial measurements on the hierarchical equality task. They are
+preliminary: we have a clean diagnostic-probe baseline and a working DAS pipeline,
+but the full complexity sweep (deeper probes and RevNet alignment maps) is not yet
+run.
+
+\paragraph{The intermediate variables are linearly decodable.} A linear probe on the
+trained MLP's first-layer activations recovers $\textsc{wx}$ and $\textsc{yz}$ with
+about $0.98$ and $0.96$ accuracy. Decodability decreases with depth (to about $0.75$
+by the third layer), while the output $O$ becomes near-perfectly decodable only in
+the deeper layers ($0.70 \to 0.997$). So at the layer where the two variables are
+most linearly present, a probe finds them almost perfectly.
+
+\paragraph{Linear DAS does not recover them causally.} Training a linear (rotation)
+alignment map at that same layer to perform the $\textsc{wx}$ interchange yields
+interchange-intervention accuracy at roughly chance ($\sim\!0.52$--$0.56$), even when
+we train on the single, label-balanced $\textsc{wx}$ intervention in isolation. This
+is not an optimisation failure of the obvious kind: the rotation receives a
+non-trivial gradient and moves steadily away from its initialisation throughout
+training; the accuracy simply does not improve. So on this model a feature that is
+almost perfectly \emph{decodable} by a linear probe is not \emph{interveneable} by a
+linear alignment map.
+
+We are cautious about over-reading this DAS number. It is below the interchange
+accuracy that linear DAS reaches on this task in \citet{sutter2025nonlinear}, which
+points to a factor specific to our setup rather than a property of linear alignment
+in general. The most likely culprit is that our trained MLP is badly calibrated: it
+produces very large logits (we observed class-logit gaps of order $50$, with
+cross-entropy of order $10$ under a random alignment), which makes the cross-entropy
+landscape the rotation is optimised on sharp and hard to descend. Calibrating the
+target model is the first thing to fix before reading anything into the DAS numbers.
+
+\section{Implementation notes}\label{sec:limitations}
+
+Two methodological points cost us the most time and are worth recording, as they
+affect anyone running DAS on this kind of data.
+
+\paragraph{Judge causal probes by held-out, order-independent evaluation.} The
+obvious training-time metric---a running average of interchange accuracy---is
+misleading here. The counterfactual data is generated in contiguous blocks that each
+share one intervention type, and for the joint (both-subspace) intervention each block
+turns out to be label-homogeneous. A running average over such blocks drifts with the
+order the blocks happen to arrive in, which looks exactly like a model that ``learns
+then collapses'' even when the alignment map is frozen. Every number above comes from
+a single order-independent pass over a held-out set, broken down by intervention type.
+
+\paragraph{The joint intervention is not informative as generated.} Because each
+joint-intervention block is a single class, it provides no signal for learning the
+equality, and its per-block accuracy merely tracks the block's label; we therefore do
+not report it. Balancing labels within each block (or mixing blocks within a gradient
+step) is needed before the joint intervention can be trained or evaluated
+meaningfully. Two smaller pitfalls: a ``fast'' intervention path we used initially
+keeps only the first of several source locations, silently dropping the second source
+in the joint intervention; and, as noted above, the target model's miscalibration is
+a likely cause of the poor DAS optimisation and has not yet been isolated.
+
 \section{Relation to prior work, and a caveat on consistency}\label{sec:related}
 
 The control-task literature is the obvious antecedent. \citet{hewitt2019control}
@@ -341,29 +398,29 @@ should still pick the best-performing probe for estimation---but it is an excell
 its growth rate is a property of the method, not a knob to tune. Measuring
 fragility is not the same as selecting against it.
 
-Finally, a caveat on what \autoref{def:capacity} does and does not capture.
-Rademacher complexity is a statement about \emph{finite-sample} memorisation
-(failure mode (b) of \autoref{sec:two-modes}). It is a tractable \emph{correlate}
-of, but not identical to, the \emph{population-level} vacuity that the two theorems
-prove (failure mode (a)). A method could have vanishing spurious capacity at finite
-$\complexity$ and still be asymptotically vacuous. We therefore present capacity as
-a measurable proxy for one---arguably the more practically dangerous---axis of
-spuriousness, not as a complete account of it.
+Finally, a caveat on what \autoref{def:capacity} measures. It is about fitting random
+targets at finite data and finite complexity. This is related to, but not the same
+as, what the two theorems prove---that at infinite complexity any target can be fit.
+A method could be reluctant to fit random targets at the complexities we actually
+test and still be able to fit anything in the limit. Our measure speaks to the
+former, the regime we use in practice, not the latter.
 
 \section{Conclusion}\label{sec:conclusion}
 
 We have argued that the diagnostic critique of \citet{pimentel2020information} and
-the causal critique of \citet{sutter2025nonlinear} are two views of one
-phenomenon---an empirical-risk maximiser flattering itself in proportion to its
-capacity---and that this phenomenon has a single, measurable name: the Rademacher
-complexity of the method's hypothesis class on the representations. Separating
-population vacuity (where the methods are equally doomed) from finite-sample
-optimism (where they need not be), we proposed to compare diagnostic probing and
-DAS in a signal--spurious plane, and identified invertibility, the frozen network,
-and multi-intervention consistency as concrete structural reasons DAS \emph{might}
-fail more gracefully. The experiment is small, the infrastructure largely exists,
-and the outcome---whichever way it falls---tells us something we currently only
-guess at: not whether our interpretability tools can fool us, but how quickly.
+the causal critique of \citet{sutter2025nonlinear} are two instances of the same
+thing: a method whose reported fit grows with its capacity to fit anything, spurious
+targets included. We proposed measuring that capacity directly---how well a method
+fits randomly relabelled data---in a form that applies to both diagnostic probing and
+DAS, and studying how it grows with complexity. Our preliminary results on the
+hierarchical equality task show a sharp contrast on the causal side: the task's
+intermediate variables are almost perfectly linearly decodable, yet a linear
+alignment map does not recover them causally on the same model. We suspect this last
+result is partly an artefact of a miscalibrated target model rather than a property
+of linear alignment, and resolving that is the first step before the full complexity
+sweep can be run. The payoff, if the sweep bears it out, is a concrete sense in which
+causal probing is the safer tool at finite complexity---even though, in the limit, it
+is no better than the diagnostic probing it was meant to improve on.
 
 \small
 \bibliographystyle{plainnat}
