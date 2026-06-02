@@ -57,10 +57,12 @@ measuring that directly---how well a method fits randomly relabelled data, which
 version of its empirical Rademacher complexity---in a form that applies unchanged to
 diagnostic probing and to DAS, and asks how this spurious-fitting capacity grows with
 complexity for each. We describe
-the measure and an experimental protocol on the hierarchical equality task, and
-report preliminary results: a linear probe recovers the task's intermediate variables
-almost perfectly, while a linear DAS map does not recover them causally on the same
-model. We discuss why, and what is needed to turn this into a clean comparison.
+the measure and an experimental protocol on the hierarchical equality task, and report
+preliminary results: on the correct labels, both a linear probe and a linear DAS map
+recover the task's intermediate variable, so the feature is at once decodable and
+interveneable. The comparison the report is about---how readily each fits
+\emph{spurious} (randomly relabelled) targets as complexity grows---is the sweep we
+are running.
 \end{abstract}
 
 \section{Motivation}\label{sec:motivation}
@@ -322,60 +324,59 @@ making this falsifiable as a feature.
 
 \section{Preliminary results}\label{sec:results}
 
-We report initial measurements on the hierarchical equality task. They are
-preliminary: we have a clean diagnostic-probe baseline and a working DAS pipeline,
-but the full complexity sweep (deeper probes and RevNet alignment maps) is not yet
-run.
+We report initial measurements on the hierarchical equality task. The signal-side
+results below are stable; the spurious-capacity comparison---the report's central
+quantity---comes from the scaling sweep, which we are still running.
 
-\paragraph{The intermediate variables are linearly decodable.} A linear probe on the
-trained MLP's first-layer activations recovers $\textsc{wx}$ and $\textsc{yz}$ with
-about $0.98$ and $0.96$ accuracy. Decodability decreases with depth (to about $0.75$
-by the third layer), while the output $O$ becomes near-perfectly decodable only in
-the deeper layers ($0.70 \to 0.997$). So at the layer where the two variables are
-most linearly present, a probe finds them almost perfectly.
+\paragraph{WX is linearly decodable, and linearly interveneable.} A linear probe on
+the trained MLP's first-layer activations recovers $\textsc{wx}$ with about $0.98$
+accuracy (decodability decreases with depth; the output $O$ becomes near-perfectly
+decodable only in the deeper layers, $0.70 \to 0.997$). A linear (rotation) alignment
+map trained at that same layer to perform the $\textsc{wx}$ interchange reaches about
+$0.999$ interchange-intervention accuracy. So, on the correct labels, both methods
+recover $\textsc{wx}$, and recover it strongly: the feature is both decodable by a
+probe and interveneable by a linear map.
 
-\paragraph{Linear DAS does not recover them causally.} Training a linear (rotation)
-alignment map at that same layer to perform the $\textsc{wx}$ interchange yields
-interchange-intervention accuracy at roughly chance ($\sim\!0.52$--$0.56$), even when
-we train on the single, label-balanced $\textsc{wx}$ intervention in isolation. This
-is not an optimisation failure of the obvious kind: the rotation receives a
-non-trivial gradient and moves steadily away from its initialisation throughout
-training; the accuracy simply does not improve. So on this model a feature that is
-almost perfectly \emph{decodable} by a linear probe is not \emph{interveneable} by a
-linear alignment map.
+\paragraph{An earlier negative result was a setup artefact.} Before restricting to a
+single intervention, we measured DAS accuracy near chance and spent some effort on it.
+That was not a property of linear alignment. The counterfactual generator produced a
+multi-intervention mix in which the joint (both-subspace) intervention yielded
+label-homogeneous batches---no training signal---and a single shared rotation was
+being asked to satisfy several intervention objectives at once. Restricting to the
+single $\textsc{wx}$ intervention (balanced batches, one objective) makes the rotation
+converge cleanly: its gradient vanishes and the learned rotation stabilises as accuracy
+approaches $1$. We flag this because the failure was instructive---with causal probing
+it is easy to mistake a data or optimisation artefact for a substantive ``the model
+does not encode this causally'' conclusion.
 
-We are cautious about over-reading this DAS number. It is below the interchange
-accuracy that linear DAS reaches on this task in \citet{sutter2025nonlinear}, which
-points to a factor specific to our setup rather than a property of linear alignment
-in general. The most likely culprit is that our trained MLP is badly calibrated: it
-produces very large logits (we observed class-logit gaps of order $50$, with
-cross-entropy of order $10$ under a random alignment), which makes the cross-entropy
-landscape the rotation is optimised on sharp and hard to descend. Calibrating the
-target model is the first thing to fix before reading anything into the DAS numbers.
+\paragraph{What remains.} With both methods recovering $\textsc{wx}$ on the correct
+labels, the question this report is about---how readily each fits \emph{spurious}
+(randomly relabelled) targets, and how that grows with complexity---is now a
+meaningful comparison. That sweep (\autoref{sec:protocol}) is in progress.
 
 \section{Implementation notes}\label{sec:limitations}
 
-Two methodological points cost us the most time and are worth recording, as they
-affect anyone running DAS on this kind of data.
+A few methodological points, mostly explaining why the setup looks the way it does.
 
-\paragraph{Judge causal probes by held-out, order-independent evaluation.} The
-obvious training-time metric---a running average of interchange accuracy---is
-misleading here. The counterfactual data is generated in contiguous blocks that each
-share one intervention type, and for the joint (both-subspace) intervention each block
-turns out to be label-homogeneous. A running average over such blocks drifts with the
-order the blocks happen to arrive in, which looks exactly like a model that ``learns
-then collapses'' even when the alignment map is frozen. Every number above comes from
-a single order-independent pass over a held-out set, broken down by intervention type.
+\paragraph{Why a single intervention.} We restrict to the $\textsc{wx}$ interchange.
+With the joint (both-subspace) intervention the data generator produces
+label-homogeneous batches---each block fixes both intermediate values, so the output
+is constant within a block---which carry no training signal; and a single shared
+rotation could not, in our hands, satisfy the single and joint interventions together.
+Both problems disappear with a single, balanced intervention, which is what let DAS
+converge (\autoref{sec:results}).
 
-\paragraph{The joint intervention is not informative as generated.} Because each
-joint-intervention block is a single class, it provides no signal for learning the
-equality, and its per-block accuracy merely tracks the block's label; we therefore do
-not report it. Balancing labels within each block (or mixing blocks within a gradient
-step) is needed before the joint intervention can be trained or evaluated
-meaningfully. Two smaller pitfalls: a ``fast'' intervention path we used initially
-keeps only the first of several source locations, silently dropping the second source
-in the joint intervention; and, as noted above, the target model's miscalibration is
-a likely cause of the poor DAS optimisation and has not yet been isolated.
+\paragraph{Judge causal probes by held-out, order-independent evaluation.} The obvious
+training-time metric---a running average of interchange accuracy---is misleading. The
+counterfactual data is stored in contiguous single-type blocks, and a running average
+over them drifts with the order the blocks arrive in, which can look exactly like a
+model that ``learns then collapses'' even when the alignment map is frozen. Every
+number we report comes from a single order-independent pass over a held-out set.
+
+\paragraph{A pyvene gotcha.} The fast intervention path keeps only the first of
+several source locations; with the (now removed) two-source joint intervention this
+silently dropped the second source. With a single source it is correct and much
+faster, so we use it.
 
 \section{Relation to prior work, and a caveat on consistency}\label{sec:related}
 
@@ -413,14 +414,15 @@ thing: a method whose reported fit grows with its capacity to fit anything, spur
 targets included. We proposed measuring that capacity directly---how well a method
 fits randomly relabelled data---in a form that applies to both diagnostic probing and
 DAS, and studying how it grows with complexity. Our preliminary results on the
-hierarchical equality task show a sharp contrast on the causal side: the task's
-intermediate variables are almost perfectly linearly decodable, yet a linear
-alignment map does not recover them causally on the same model. We suspect this last
-result is partly an artefact of a miscalibrated target model rather than a property
-of linear alignment, and resolving that is the first step before the full complexity
-sweep can be run. The payoff, if the sweep bears it out, is a concrete sense in which
-causal probing is the safer tool at finite complexity---even though, in the limit, it
-is no better than the diagnostic probing it was meant to improve on.
+hierarchical equality task show that, on the correct labels, the task's intermediate
+variable is both linearly decodable by a probe ($\sim\!0.98$) and linearly
+interveneable by an alignment map ($\sim\!0.999$ IIA); an earlier near-chance DAS
+reading turned out to be an artefact of a multi-intervention data and optimisation
+setup, not a property of linear alignment. With both methods recovering the signal,
+the remaining and central comparison is their spurious-fitting capacity as complexity
+grows. The payoff, if the sweep bears it out, is a concrete sense in which causal
+probing is the safer tool at finite complexity---even though, in the limit, it is no
+better than the diagnostic probing it was meant to improve on.
 
 \small
 \bibliographystyle{plainnat}
