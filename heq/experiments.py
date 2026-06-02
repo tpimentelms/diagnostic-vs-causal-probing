@@ -9,6 +9,8 @@ while the correct-label fit persists. The ``n`` at which the random fit collapse
 the capacity signature we want to compare across methods.
 """
 
+import random
+
 import numpy as np
 import torch
 from sklearn.linear_model import LogisticRegression
@@ -72,7 +74,7 @@ def _rotation_state(intervenable):
 
 def run_das_scaling(trained, train_causal_model, test_dataset, embedding_dim,
                     sampler, cache_params, das_configs=DAS_SCALE_CONFIGS,
-                    eval_batch_size=640, lr=0.01, warmup_steps=10, device="cpu"):
+                    eval_batch_size=640, lr=0.01, warmup_steps=10, seed=0, device="cpu"):
     """DAS train-fit (capacity) vs n, on correct and on fixed-random labels.
 
     accumulation_steps=1 and a roughly constant optimiser budget ensure each fit is
@@ -88,7 +90,7 @@ def run_das_scaling(trained, train_causal_model, test_dataset, embedding_dim,
         dataset = load_or_generate_counterfactual(
             "scale", train_causal_model, n, b, sampler, **cf_params
         )
-        rand_dataset = _shuffle_labels(dataset)
+        rand_dataset = _shuffle_labels(dataset, seed=seed)
 
         for key, ds in [("correct", dataset), ("random", rand_dataset)]:
             reset_das_rotation(intervenable, embedding_dim * 4)
@@ -111,34 +113,78 @@ def run_das_scaling(trained, train_causal_model, test_dataset, embedding_dim,
     return results, rotations
 
 
-def save_scaling_checkpoint(probe_results, das_results, das_rotations, path=None):
-    """Persist scaling results and the trained DAS rotations, so the (slow) sweep need
-    not be re-run to re-plot or re-evaluate later. Load with ``torch.load(path)``.
+def _aggregate_scaling(probe_runs, das_runs):
+    """Stack per-seed curves into mean and std (across seeds) for each plotted curve."""
+    def agg(curves):
+        a = np.array(curves, dtype=float)  # [n_seeds, n_sizes]
+        return {"mean": a.mean(0), "std": a.std(0)}
+    return {
+        "probe_correct": agg([r["WX"]["correct"]["train"] for r in probe_runs]),
+        "probe_random":  agg([r["WX"]["random"]["train"]  for r in probe_runs]),
+        "das_correct":   agg([r["correct"]["train"] for r in das_runs]),
+        "das_random":    agg([r["random"]["train"]  for r in das_runs]),
+    }
+
+
+def run_scaling_seeds(trained, train_ds, test_ds, train_causal_model, test_dataset,
+                      embedding_dim, sampler, cache_params, seeds=(0, 1, 2), device="cpu"):
+    """Run the probe and DAS scaling sweeps over several seeds and aggregate them.
+
+    Each seed re-randomises the *fitting* (the probe's subsample and random labelling;
+    DAS's rotation init and random labelling) on the same cached representations, so the
+    bands reflect run-to-run variance of the methods, not of the data. Returns
+    ``(aggregate, probe_runs, das_runs, das_rotations)``.
+    """
+    probe_runs, das_runs, das_rotations = [], [], {}
+    for s in seeds:
+        np.random.seed(s)
+        torch.manual_seed(s)
+        random.seed(s)
+        print(f"\n--- scaling seed {s} ---")
+        probe_runs.append(
+            run_probe_scaling(trained, train_ds, test_ds, embedding_dim, device=device))
+        das_res, rots = run_das_scaling(
+            trained, train_causal_model, test_dataset, embedding_dim,
+            sampler, cache_params, seed=s, device=device)
+        das_runs.append(das_res)
+        das_rotations[f"seed{s}"] = rots
+    return _aggregate_scaling(probe_runs, das_runs), probe_runs, das_runs, das_rotations
+
+
+def save_scaling_checkpoint(aggregate, probe_runs, das_runs, das_rotations, path=None):
+    """Persist aggregated + per-seed scaling results and the trained DAS rotations, so
+    the (slow) sweep need not be re-run to re-plot or re-evaluate. Load with torch.load.
     """
     path = path or (CACHE_DIR / "scaling_checkpoint.pt")
     CACHE_DIR.mkdir(exist_ok=True)
-    torch.save({"probe_results": probe_results,
-                "das_results": das_results,
+    torch.save({"aggregate": aggregate,
+                "probe_runs": probe_runs,
+                "das_runs": das_runs,
                 "das_rotations": das_rotations}, str(path))
     print(f"Saved scaling checkpoint to {path}")
 
 
-def plot_scaling_experiment(probe_results, das_results, save_path="scaling.png"):
-    """Train-set fit vs n on a single axis: solid = correct labels (signal),
-    dashed = random labels (spurious capacity); blue = probe, green = DAS. The method
-    whose random (dashed) curve drops to chance at smaller n has lower spurious capacity.
+def plot_scaling_seeds(aggregate, save_path="scaling.png"):
+    """Train-set fit vs n: mean over seeds with shaded ±1 std bands. Solid = correct
+    labels (signal), dashed = random labels (spurious capacity); blue = probe, green =
+    DAS. The method whose random (dashed) band drops to chance at smaller n has lower
+    spurious-fitting capacity.
     """
     import matplotlib.pyplot as plt
 
-    n_probe = SCALE_N[:len(probe_results["WX"]["correct"]["train"])]
-    n_das = SCALE_N[:len(das_results["correct"]["train"])]
+    n = SCALE_N[:len(aggregate["probe_correct"]["mean"])]
     c = {"probe": "#1f77b4", "das": "#2ca02c"}
-
+    curves = [
+        ("probe_correct", c["probe"], "-",  "o", "Probe – correct"),
+        ("probe_random",  c["probe"], "--", "o", "Probe – random"),
+        ("das_correct",   c["das"],   "-",  "s", "DAS – correct"),
+        ("das_random",    c["das"],   "--", "s", "DAS – random"),
+    ]
     _, ax = plt.subplots(figsize=(7, 5))
-    ax.plot(n_probe, probe_results["WX"]["correct"]["train"], "-o",  color=c["probe"], label="Probe – correct")
-    ax.plot(n_probe, probe_results["WX"]["random"]["train"],  "--o", color=c["probe"], label="Probe – random")
-    ax.plot(n_das,   das_results["correct"]["train"],         "-s",  color=c["das"],   label="DAS – correct")
-    ax.plot(n_das,   das_results["random"]["train"],          "--s", color=c["das"],   label="DAS – random")
+    for key, color, ls, marker, label in curves:
+        m, s = np.array(aggregate[key]["mean"]), np.array(aggregate[key]["std"])
+        ax.plot(n, m, linestyle=ls, marker=marker, color=color, label=label)
+        ax.fill_between(n, m - s, m + s, color=color, alpha=0.15, linewidth=0)
     ax.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="Chance")
     ax.set_xscale("log")
     ax.set_xlabel("Training examples (n)")
@@ -149,5 +195,5 @@ def plot_scaling_experiment(probe_results, das_results, save_path="scaling.png")
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"Saved plot to {save_path}")
+    print(f"Saved plot to {save_path} (mean +/- 1 std over seeds)")
     plt.show()

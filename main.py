@@ -30,9 +30,8 @@ from heq.data import (
 )
 from heq.das import build_das_intervenable, eval_das, train_das
 from heq.experiments import (
-    plot_scaling_experiment,
-    run_das_scaling,
-    run_probe_scaling,
+    plot_scaling_seeds,
+    run_scaling_seeds,
     save_scaling_checkpoint,
 )
 from heq.models import load_or_train_mlp
@@ -90,6 +89,9 @@ def get_args():
     parser.add_argument("--das-accumulation", type=int, default=0,
                         help="DAS grad-accumulation steps; 0 = auto (effective batch ~6400). "
                              "Set 1 to update every minibatch (10x more updates at batch 640).")
+    parser.add_argument("--scaling-seeds", type=lambda s: tuple(int(x) for x in s.split(",")),
+                        default=(0, 1, 2), help="comma-separated seeds for the scaling sweep "
+                                                "(confidence bands are mean +/- std over these)")
     # Logging.
     parser.add_argument("--wandb-project", type=str, default="das-hierarchical-equality")
     parser.add_argument("--wandb-run-name", type=str, default=None)
@@ -155,14 +157,13 @@ def main(args):
         eval_das(intervenable, test_dataset, dim, batch_size=args.das_batch_size, device=device)
 
     if "scaling" in steps:
-        print("\n=== Scaling Experiment: Probes vs DAS (correct vs random labels) ===")
-        probe_results = run_probe_scaling(trained, train_ds, test_ds, dim, device=device)
-        das_results, das_rotations = run_das_scaling(
-            trained, train_causal_model, test_dataset, dim,
-            sampler, cache_params, device=device,
+        print("\n=== Scaling Experiment: Probes vs DAS (correct vs random, seed-averaged) ===")
+        aggregate, probe_runs, das_runs, das_rotations = run_scaling_seeds(
+            trained, train_ds, test_ds, train_causal_model, test_dataset, dim,
+            sampler, cache_params, seeds=args.scaling_seeds, device=device,
         )
-        save_scaling_checkpoint(probe_results, das_results, das_rotations)
-        plot_scaling_experiment(probe_results, das_results)
+        save_scaling_checkpoint(aggregate, probe_runs, das_runs, das_rotations)
+        plot_scaling_seeds(aggregate)
 
     if wandb.run is not None:
         wandb.finish()
