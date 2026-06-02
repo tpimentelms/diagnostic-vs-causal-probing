@@ -29,7 +29,12 @@ from heq.data import (
     make_input_sampler,
 )
 from heq.das import build_das_intervenable, eval_das, train_das
-from heq.experiments import plot_scaling_experiment, run_das_scaling, run_probe_scaling
+from heq.experiments import (
+    plot_scaling_experiment,
+    run_das_scaling,
+    run_probe_scaling,
+    save_scaling_checkpoint,
+)
 from heq.models import load_or_train_mlp
 from heq.probing import run_probe_experiment
 
@@ -152,10 +157,11 @@ def main(args):
     if "scaling" in steps:
         print("\n=== Scaling Experiment: Probes vs DAS (correct vs random labels) ===")
         probe_results = run_probe_scaling(trained, train_ds, test_ds, dim, device=device)
-        das_results = run_das_scaling(
+        das_results, das_rotations = run_das_scaling(
             trained, train_causal_model, test_dataset, dim,
             sampler, cache_params, device=device,
         )
+        save_scaling_checkpoint(probe_results, das_results, das_rotations)
         plot_scaling_experiment(probe_results, das_results)
 
     if wandb.run is not None:

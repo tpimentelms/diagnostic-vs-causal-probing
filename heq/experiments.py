@@ -10,10 +10,11 @@ the capacity signature we want to compare across methods.
 """
 
 import numpy as np
+import torch
 from sklearn.linear_model import LogisticRegression
 from tqdm import tqdm
 
-from heq.config import DAS_SCALE_CONFIGS, SCALE_N
+from heq.config import CACHE_DIR, DAS_SCALE_CONFIGS, SCALE_N
 from heq.das import build_das_intervenable, eval_das, reset_das_rotation, train_das
 from heq.data import load_or_generate_counterfactual
 from heq.probing import collect_activations, probe_labels
@@ -63,6 +64,12 @@ def _shuffle_labels(dataset, seed=0):
                    .with_format("torch"))
 
 
+def _rotation_state(intervenable):
+    """A CPU copy of the (shared) rotation's state, for checkpointing."""
+    for v in intervenable.interventions.values():
+        return {k: t.detach().cpu().clone() for k, t in v.rotate_layer.state_dict().items()}
+
+
 def run_das_scaling(trained, train_causal_model, test_dataset, embedding_dim,
                     sampler, cache_params, das_configs=DAS_SCALE_CONFIGS,
                     eval_batch_size=640, lr=0.01, warmup_steps=10, device="cpu"):
@@ -73,6 +80,7 @@ def run_das_scaling(trained, train_causal_model, test_dataset, embedding_dim,
     """
     intervenable = build_das_intervenable(trained, device)
     results = {"correct": {"train": [], "test": []}, "random": {"train": []}}
+    rotations = {}  # trained rotation per (n, condition), for checkpointing
 
     for n, b in tqdm(das_configs, desc="DAS scale"):
         epochs = max(30, DAS_TARGET_UPDATES * b // n)  # ~DAS_TARGET_UPDATES optimiser steps (accum=1)
@@ -90,6 +98,7 @@ def run_das_scaling(trained, train_causal_model, test_dataset, embedding_dim,
                 lr=lr, warmup_steps=warmup_steps, randomize_labels=False,
                 verbose=False, device=device,
             )
+            rotations[f"n{n}_{key}"] = _rotation_state(intervenable)
             # train fit: evaluate on the very set it was fit to (batch=b keeps one
             # intervention type per batch, as _run_intervenable_batch requires).
             results[key]["train"].append(
@@ -99,33 +108,44 @@ def run_das_scaling(trained, train_causal_model, test_dataset, embedding_dim,
                     eval_das(intervenable, test_dataset, embedding_dim,
                              batch_size=eval_batch_size, verbose=False, device=device))
 
-    return results
+    return results, rotations
+
+
+def save_scaling_checkpoint(probe_results, das_results, das_rotations, path=None):
+    """Persist scaling results and the trained DAS rotations, so the (slow) sweep need
+    not be re-run to re-plot or re-evaluate later. Load with ``torch.load(path)``.
+    """
+    path = path or (CACHE_DIR / "scaling_checkpoint.pt")
+    CACHE_DIR.mkdir(exist_ok=True)
+    torch.save({"probe_results": probe_results,
+                "das_results": das_results,
+                "das_rotations": das_rotations}, str(path))
+    print(f"Saved scaling checkpoint to {path}")
 
 
 def plot_scaling_experiment(probe_results, das_results, save_path="scaling.png"):
-    """Train-set fit vs n, with the probe and DAS on the same axes, split into one
-    panel for correct labels (signal) and one for random labels (spurious capacity).
+    """Train-set fit vs n on a single axis: solid = correct labels (signal),
+    dashed = random labels (spurious capacity); blue = probe, green = DAS. The method
+    whose random (dashed) curve drops to chance at smaller n has lower spurious capacity.
     """
     import matplotlib.pyplot as plt
 
     n_probe = SCALE_N[:len(probe_results["WX"]["correct"]["train"])]
     n_das = SCALE_N[:len(das_results["correct"]["train"])]
+    c = {"probe": "#1f77b4", "das": "#2ca02c"}
 
-    colors = {"WX": "#1f77b4", "DAS": "#2ca02c"}
-    _, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
-
-    for ax, key, title in [(axes[0], "correct", "Correct labels (signal)"),
-                           (axes[1], "random", "Random labels (spurious capacity)")]:
-        ax.plot(n_probe, probe_results["WX"][key]["train"], marker="o", color=colors["WX"], label="Probe – WX")
-        ax.plot(n_das, das_results[key]["train"], marker="s", color=colors["DAS"], label="DAS – WX")
-        ax.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="Chance")
-        ax.set_xscale("log")
-        ax.set_xlabel("Training examples (n)")
-        ax.set_title(title)
-        ax.set_ylim(0.4, 1.02)
-        ax.legend(fontsize=9)
-        ax.grid(True, which="both", alpha=0.3)
-    axes[0].set_ylabel("Train-set fit (accuracy)")
+    _, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(n_probe, probe_results["WX"]["correct"]["train"], "-o",  color=c["probe"], label="Probe – correct")
+    ax.plot(n_probe, probe_results["WX"]["random"]["train"],  "--o", color=c["probe"], label="Probe – random")
+    ax.plot(n_das,   das_results["correct"]["train"],         "-s",  color=c["das"],   label="DAS – correct")
+    ax.plot(n_das,   das_results["random"]["train"],          "--s", color=c["das"],   label="DAS – random")
+    ax.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="Chance")
+    ax.set_xscale("log")
+    ax.set_xlabel("Training examples (n)")
+    ax.set_ylabel("Train-set fit (accuracy)")
+    ax.set_ylim(0.4, 1.02)
+    ax.legend(fontsize=9)
+    ax.grid(True, which="both", alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
